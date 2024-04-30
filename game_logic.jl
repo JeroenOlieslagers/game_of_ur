@@ -255,11 +255,11 @@ function move_piece(s::UInt32, from::Int, to::Int, bs::Vector{UInt32}, bbs::Vect
 end
 
 """
-    possible_neighbours(s, roll, bs, bbs)
+    neighbours(s, roll, bs, bbs)
 
 Get list of possible neighbouring states from state `s` and dice roll `roll`.
 """
-function possible_neighbours(s::UInt32, roll::Int, bs::Vector{UInt32}, bbs::Vector{UInt32})::Vector{UInt32}
+function neighbours(s::UInt32, roll::Int, bs::Vector{UInt32}, bbs::Vector{UInt32})::Vector{UInt32}
     if roll == 0
         return [flip_turn(s, bs, bbs)]
     end
@@ -334,12 +334,12 @@ function possible_neighbours(s::UInt32, roll::Int, bs::Vector{UInt32}, bbs::Vect
 end
 
 """
-    possible_neighbours!(ns, s, roll, bs, bbs)
+    neighbours!(ns, s, roll, bs, bbs)
 
 Get list of possible neighbouring states from state `s` and dice roll `roll`. Operation is in-place on existing list of
 seven UInt32 `ns` which will be updated to remove memory allocations.
 """
-function possible_neighbours!(ns::Vector{UInt32}, s::UInt32, roll::Int, bs::Vector{UInt32}, bbs::Vector{UInt32})::Nothing
+function neighbours!(ns::Vector{UInt32}, s::UInt32, roll::Int, bs::Vector{UInt32}, bbs::Vector{UInt32})::Nothing
     # Maximum 7 actions in a state
     fill!(ns, 0)
     idx = 0
@@ -511,11 +511,11 @@ function to_move(s::UInt32, from::Int, to::Int, bs::Vector{UInt32}, bbs::Vector{
 end
 
 """
-    possible_neighbours_moves(s, roll, bs, bbs)
+    neighbours_moves(s, roll, bs, bbs)
 
 Get list of possible neighbouring states from state `s` and dice roll `roll` as well as associated moves.
 """
-function possible_neighbours_moves(s::UInt32, roll::Int, bs::Vector{UInt32}, bbs::Vector{UInt32})::Tuple{Vector{UInt32}, Vector{Tuple{UInt8, UInt8, Bool, Bool}}}
+function neighbours_moves(s::UInt32, roll::Int, bs::Vector{UInt32}, bbs::Vector{UInt32})::Tuple{Vector{UInt32}, Vector{Tuple{UInt8, UInt8, Bool, Bool}}}
     if roll == 0
         return [flip_turn(s, bs, bbs)], [(UInt8(0), UInt8(0), false, false)]
     end

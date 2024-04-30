@@ -44,7 +44,7 @@ function bfs(s_start::UInt32, bs::Vector{UInt32}, bbs::Vector{UInt32}; max_iter=
     frontier = Vector{UInt32}()
     pushfirst!(frontier, s_start)
     # Closed list of leaf nodes
-    leaf_nodes = Set{UInt32}()
+    leafs = Set{UInt32}()
     # Closed lists of visited nodes per (m, n) tuple
     visited = get_pieces_dict(s_start, bs, bbs)
     ns = zeros(UInt32, 7)
@@ -57,18 +57,18 @@ function bfs(s_start::UInt32, bs::Vector{UInt32}, bbs::Vector{UInt32}; max_iter=
         end
         # If search is done
         if isempty(frontier)
-            return visited, leaf_nodes
+            return visited, leafs
         end
         # BFS next expansion
         s = pop!(frontier)
         for roll in 0:4
-            possible_neighbours!(ns, s, roll, bs, bbs)
+            neighbours!(ns, s, roll, bs, bbs)
             for neighbour in ns
                 # Check for turn change
                 neighbour, factor = turn_change(neighbour, bs)
                 # Check if terminal state
                 if has_won(neighbour, bs, bbs)
-                    push!(leaf_nodes, neighbour)
+                    push!(leafs, neighbour)
                 else
                     pieces = pieces_on_board(neighbour, bs, bbs)
                     if neighbour ∉ visited[pieces]

@@ -49,7 +49,7 @@ function get_new_value!(ns::Vector{UInt32}, s::UInt32, bs::Vector{UInt32}, bbs::
     nv += -Ps[1]*V[sp]
     # Other rolls don't just flip turn
     for roll in 1:4
-        possible_neighbours!(ns, s, roll, bs, bbs)
+        neighbours!(ns, s, roll, bs, bbs)
         # Get max across possible actions
         nvv = -Inf
         for neighbour in ns
