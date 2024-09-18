@@ -22,7 +22,7 @@ Get closed lists for visited states in dict where key is (m, n).
 """
 function get_pieces_dict(s::UInt32, bs::Vector{UInt32}, bbs::Vector{UInt32})::Dict{Tuple{Int, Int}, Set{UInt32}}
     visited = Dict{Tuple{Int, Int}, Set{UInt32}}()
-    pieces = pieces_on_board(s, bs, bbs)
+    pieces = pieces_left(s, bs, bbs)
     # Number of pieces in game
     N = pieces[1]
     # Generate independent state spaces
@@ -62,15 +62,23 @@ function bfs(s_start::UInt32, bs::Vector{UInt32}, bbs::Vector{UInt32}; max_iter=
         # BFS next expansion
         s = pop!(frontier)
         for roll in 0:4
-            neighbours!(ns, s, roll, bs, bbs)
+            if roll == 0
+                fill!(ns, 0)
+                ns[1] = flip_turn(s, bs, bbs) - bs[32]
+            else
+                neighbours!(ns, s, roll, bs, bbs)
+            end
             for neighbour in ns
+                if neighbour == 0
+                    break
+                end
                 # Check for turn change
                 neighbour, factor = turn_change(neighbour, bs)
                 # Check if terminal state
                 if has_won(neighbour, bs, bbs)
                     push!(leafs, neighbour)
                 else
-                    pieces = pieces_on_board(neighbour, bs, bbs)
+                    pieces = pieces_left(neighbour, bs, bbs)
                     if neighbour ∉ visited[pieces]
                         push!(visited[pieces], neighbour)
                         pushfirst!(frontier, neighbour)

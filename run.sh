@@ -8,4 +8,4 @@
 #SBATCH --job-name=UR_parallel
 #SBATCH --output=slurm_%j.out
 
-julia -t auto main.jl
+julia -t auto solver/main.jl
