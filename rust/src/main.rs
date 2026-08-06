@@ -2328,6 +2328,562 @@ fn validate_encoding(lut: &TrainingLut, samples: usize) {
     println!("sampled_successors_checked={successors_checked}");
 }
 
+// ---------------------------------------------------------------------------
+// Agent evaluation: heuristics, exact move regret, and the stage curve.
+//
+// Everything here scores an agent against the exact solution, so no Monte Carlo
+// noise enters the value estimates. Heuristics are written as drop-in
+// replacements for the lookup table -- each returns a light-favouring score, the
+// same shape as Lut::light_win_percent -- so one argmax routine serves them all.
+// ---------------------------------------------------------------------------
+
+const FEATURE_COUNT: usize = 12;
+const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
+    "advancement_self", "advancement_opp", "scored_self", "scored_opp",
+    "hand_self", "hand_opp", "safe_self", "safe_opp",
+    "exposure_self", "threat_self", "centre_self", "frontmost_self",
+];
+
+/// Features of a position, always from the perspective of the player to move.
+///
+/// Board pieces store their own path index (`sign * (path_index + 1)`), so
+/// advancement is just the sum of the stored magnitudes.
+fn features(lut: &Lut, game: &Game) -> [f64; FEATURE_COUNT] {
+    let sign = game.turn_sign();
+    let (self_path, opp_path) = if game.is_light_turn {
+        (lut.rules.light_path(), lut.rules.dark_path())
+    } else {
+        (lut.rules.dark_path(), lut.rules.light_path())
+    };
+
+    let mut advancement_self = 0.0;
+    let mut advancement_opp = 0.0;
+    let mut frontmost_self: f64 = 0.0;
+    for tile in 0..BOARD_LEN {
+        let piece = game.board[tile];
+        if piece == 0 {
+            continue;
+        }
+        let progress = piece.abs() as f64;
+        if piece * sign > 0 {
+            advancement_self += progress;
+            frontmost_self = frontmost_self.max(progress);
+        } else {
+            advancement_opp += progress;
+        }
+    }
+
+    // Private tiles: on one player's path only, so they cannot be captured.
+    let (safe_self_tiles, safe_opp_tiles) = if game.is_light_turn {
+        (&lut.encoding.light_safe_indices, &lut.encoding.dark_safe_indices)
+    } else {
+        (&lut.encoding.dark_safe_indices, &lut.encoding.light_safe_indices)
+    };
+    let count_on = |tiles: &Vec<usize>, want_self: bool| {
+        tiles
+            .iter()
+            .filter(|&&tile| {
+                let piece = game.board[tile];
+                piece != 0 && ((piece * sign > 0) == want_self)
+            })
+            .count() as f64
+    };
+
+    let (scored_self, scored_opp) = if game.is_light_turn {
+        (game.light_score, game.dark_score)
+    } else {
+        (game.dark_score, game.light_score)
+    };
+    let (hand_self, hand_opp) = if game.is_light_turn {
+        (game.light_pieces, game.dark_pieces)
+    } else {
+        (game.dark_pieces, game.light_pieces)
+    };
+
+    let _ = (self_path, opp_path);
+    [
+        advancement_self,
+        advancement_opp,
+        scored_self as f64,
+        scored_opp as f64,
+        hand_self as f64,
+        hand_opp as f64,
+        count_on(safe_self_tiles, true),
+        count_on(safe_opp_tiles, false),
+        capture_probability(lut, game, false),
+        capture_probability(lut, game, true),
+        if game.board[CENTRE_ROSETTE] * sign > 0 { 1.0 } else { 0.0 },
+        frontmost_self,
+    ]
+}
+
+/// The contested rosette in the middle lane, board tile (2, 4).
+const CENTRE_ROSETTE: usize = 10;
+
+/// Probability that a capture is available on the next turn.
+///
+/// With `for_mover` false this is the exposure of the moving player's pieces:
+/// the chance the opponent, moving next, can take one of them. With `for_mover`
+/// true it is the moving player's own capture chances. Move generation is reused
+/// rather than reimplemented, so the safe-rosette rule is honoured for free.
+fn capture_probability(lut: &Lut, game: &Game, for_mover: bool) -> f64 {
+    let mut probe = game.clone();
+    if !for_mover {
+        probe.is_light_turn = !probe.is_light_turn;
+    }
+    probe.roll = -1;
+    let sign = probe.turn_sign();
+    let path = if probe.is_light_turn { lut.rules.light_path() } else { lut.rules.dark_path() };
+
+    let mut total = 0.0;
+    let mut moves = [0i8; 8];
+    for (roll, &probability) in lut.rules.roll_probabilities().iter().enumerate() {
+        if probability == 0.0 {
+            continue;
+        }
+        let mut rolled = probe.clone();
+        let count = rolled.apply_roll(roll as u8, &mut moves);
+        let captures = moves[..count].iter().any(|&source| {
+            let destination = source as isize + roll as isize;
+            if destination < 0 || destination as usize >= path.len() {
+                return false;
+            }
+            let occupant = rolled.board[path[destination as usize]];
+            occupant != 0 && occupant * sign < 0
+        });
+        if captures {
+            total += probability;
+        }
+    }
+    total
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Heuristic {
+    Random,
+    Advancement,
+    Lead,
+    ScoreRace,
+    Safety,
+    Centre,
+    Exposure,
+    Composite,
+}
+
+impl Heuristic {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::Advancement => "advancement",
+            Self::Lead => "lead",
+            Self::ScoreRace => "score_race",
+            Self::Safety => "safety",
+            Self::Centre => "centre",
+            Self::Exposure => "exposure",
+            Self::Composite => "composite",
+        }
+    }
+
+    fn all() -> &'static [Heuristic] {
+        &[
+            Self::Random, Self::Advancement, Self::Lead, Self::ScoreRace,
+            Self::Safety, Self::Centre, Self::Exposure, Self::Composite,
+        ]
+    }
+
+    /// Weights over FEATURE_NAMES. Hand-set to make each rung of the ladder
+    /// isolate one idea; the fitted model replaces these with regression on the
+    /// exact values.
+    fn weights(self, path_len: f64) -> [f64; FEATURE_COUNT] {
+        let mut w = [0.0; FEATURE_COUNT];
+        match self {
+            Self::Random => {}
+            Self::Advancement => {
+                w[0] = 1.0;
+            }
+            Self::Lead => {
+                w[0] = 1.0;
+                w[1] = -1.0;
+            }
+            Self::ScoreRace => {
+                w[0] = 1.0;
+                w[1] = -1.0;
+                // A scored piece is safe forever, so it is worth more than the
+                // advancement it represents.
+                w[2] = 2.0 * path_len;
+                w[3] = -2.0 * path_len;
+            }
+            Self::Safety => {
+                w[0] = 1.0;
+                w[1] = -1.0;
+                w[2] = 2.0 * path_len;
+                w[3] = -2.0 * path_len;
+                w[6] = 2.0;
+                w[7] = -2.0;
+            }
+            Self::Centre => {
+                w[0] = 1.0;
+                w[1] = -1.0;
+                w[2] = 2.0 * path_len;
+                w[3] = -2.0 * path_len;
+                w[6] = 2.0;
+                w[7] = -2.0;
+                w[10] = 4.0;
+            }
+            Self::Exposure | Self::Composite => {
+                w[0] = 1.0;
+                w[1] = -1.0;
+                w[2] = 2.0 * path_len;
+                w[3] = -2.0 * path_len;
+                w[6] = 2.0;
+                w[7] = -2.0;
+                w[10] = 4.0;
+                // Exposure and threat are probabilities; scale them to be
+                // comparable with a few squares of advancement.
+                w[8] = -6.0;
+                if self == Self::Composite {
+                    w[9] = 3.0;
+                    w[11] = 0.5;
+                }
+            }
+        }
+        w
+    }
+}
+
+/// A light-favouring score for a position, mirroring Lut::light_win_percent so
+/// heuristics can be swapped in wherever the table is used.
+fn heuristic_light_value(
+    weights: Option<&[f64; FEATURE_COUNT]>,
+    lut: &Lut,
+    game: &Game,
+    rng: &mut SplitMix64,
+) -> f64 {
+    if game.finished {
+        return if game.light_score >= lut.rules.pieces() { f64::INFINITY } else { f64::NEG_INFINITY };
+    }
+    let Some(weights) = weights else {
+        // Uniform noise, so argmax picks a uniformly random legal move.
+        return (rng.next_u64() >> 11) as f64;
+    };
+    let features = features(lut, game);
+    let score: f64 = features.iter().zip(weights.iter()).map(|(f, w)| f * w).sum();
+    // features() is written from the mover's perspective; flip to light's.
+    if game.is_light_turn { score } else { -score }
+}
+
+/// Pick a move with an arbitrary evaluator, mirroring choose_optimal_move.
+fn choose_move_with(
+    weights: Option<&[f64; FEATURE_COUNT]>,
+    lut: &Lut,
+    game: &Game,
+    moves: &[i8],
+    rng: &mut SplitMix64,
+) -> i8 {
+    assert!(!moves.is_empty());
+    if moves.len() == 1 {
+        return moves[0];
+    }
+    let light_turn = game.is_light_turn;
+    let mut best_move = moves[0];
+    let mut best = if light_turn { f64::NEG_INFINITY } else { f64::INFINITY };
+    for &source in moves {
+        let mut next = game.clone();
+        next.apply_move(source, lut.rules);
+        let value = heuristic_light_value(weights, lut, &next, rng);
+        let better = if light_turn { value > best } else { value < best };
+        if better {
+            best = value;
+            best_move = source;
+        }
+    }
+    best_move
+}
+
+/// Index of a state's score layer in the order the solver completes them.
+fn layer_index_of(lut: &Lut, game: &Game, pair_to_index: &[usize]) -> usize {
+    let low = game.light_score.min(game.dark_score) as usize;
+    let high = game.light_score.max(game.dark_score) as usize;
+    let _ = lut;
+    pair_to_index[low * 8 + high]
+}
+
+/// Play one game where `stage_agent` plays optimally only once the position has
+/// reached score layer `stage` or later in solve order, and uniformly at random
+/// before that. The opponent always plays optimally. Returns true if the stage
+/// agent won.
+fn play_stage_game(
+    lut: &Lut,
+    stage: usize,
+    stage_agent_is_light: bool,
+    pair_to_index: &[usize],
+    rng: &mut SplitMix64,
+) -> bool {
+    let mut game = Game::initial(lut.rules);
+    let mut moves = [0i8; 8];
+    let mut plies = 0usize;
+    while !game.finished {
+        plies += 1;
+        assert!(plies < 100_000, "game failed to terminate");
+        let roll = lut.rules.roll(rng);
+        let count = game.apply_roll(roll, &mut moves);
+        if count == 0 {
+            continue;
+        }
+        let stage_agent_to_move = game.is_light_turn == stage_agent_is_light;
+        // Layers are solved from high scores down, so a layer index below
+        // `stage` is one the agent would already have solved.
+        let solved_here = layer_index_of(lut, &game, pair_to_index) < stage;
+        let source = if stage_agent_to_move && !solved_here {
+            moves[rng.index(count)]
+        } else {
+            choose_optimal_move(lut, &game, &moves[..count])
+        };
+        game.apply_move(source, lut.rules);
+    }
+    (game.light_score >= lut.rules.pieces()) == stage_agent_is_light
+}
+
+/// Stage 0 of the analysis roadmap: how much of the game's difficulty lives in
+/// each score layer. For every stage k, an agent that plays randomly until the
+/// position reaches layer k and optimally thereafter is scored against a fully
+/// optimal opponent, alternating sides so a converged agent sits at 50%.
+fn stage_curve(model: &Path, output: &Path, games_per_stage: usize, seed: u64) {
+    let lut = Lut::read(model);
+    let pairs = score_pairs(lut.rules.pieces());
+    let mut pair_to_index = vec![usize::MAX; 64];
+    for (index, &(low, high)) in pairs.iter().enumerate() {
+        pair_to_index[low as usize * 8 + high as usize] = index;
+    }
+
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let mut output_file = BufWriter::new(File::create(output).unwrap());
+    writeln!(
+        output_file,
+        "stage,layer_min,layer_max,layer_states,cumulative_states,games,wins,win_pct"
+    )
+    .unwrap();
+
+    // Layer sizes give a self-contained x axis (states solved so far). Multiply
+    // by per-layer sweep counts from a training log to get state expansions.
+    let mut layer_states = vec![0usize; pairs.len()];
+    let started = Instant::now();
+    for global in 0..lut.total {
+        let (key, _) = lut.key_value_at_global(global);
+        let (light, dark) = lut.encoding.scores(key);
+        if light >= lut.rules.pieces() || dark >= lut.rules.pieces() {
+            continue;
+        }
+        let index = pair_to_index[light.min(dark) as usize * 8 + light.max(dark) as usize];
+        if index != usize::MAX {
+            layer_states[index] += 1;
+        }
+    }
+    eprintln!("counted layer sizes in {:.1}s", started.elapsed().as_secs_f64());
+
+    let mut cumulative = 0usize;
+    for (stage, &pair) in pairs.iter().enumerate() {
+        cumulative += layer_states[stage];
+        // stage k means "layers with index < k are solved", so evaluate the
+        // agent that has completed stages 0..=stage.
+        let solved_through = stage + 1;
+        let chunk = (games_per_stage + threads - 1) / threads;
+        let wins: usize = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut remaining = games_per_stage;
+            for thread_index in 0..threads {
+                let count = chunk.min(remaining);
+                remaining -= count;
+                let pair_to_index = &pair_to_index;
+                let lut = &lut;
+                handles.push(scope.spawn(move || {
+                    let mut rng = SplitMix64::new(
+                        seed ^ ((stage as u64) << 32)
+                            ^ (thread_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                    );
+                    let mut wins = 0usize;
+                    for game_index in 0..count {
+                        // Alternate sides so the ceiling is exactly 50%.
+                        let as_light = game_index % 2 == 0;
+                        if play_stage_game(lut, solved_through, as_light, pair_to_index, &mut rng) {
+                            wins += 1;
+                        }
+                    }
+                    wins
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        let percent = 100.0 * wins as f64 / games_per_stage as f64;
+        writeln!(
+            output_file,
+            "{stage},{},{},{},{cumulative},{games_per_stage},{wins},{percent:.6}",
+            pair.0, pair.1, layer_states[stage]
+        )
+        .unwrap();
+        eprintln!(
+            "stage={stage} layer=[{},{}] states={} win={percent:.3}%",
+            pair.0, pair.1, layer_states[stage]
+        );
+    }
+    output_file.flush().unwrap();
+}
+
+/// Stage 1: exact move regret for each heuristic, with no simulation.
+///
+/// For a sampled state, regret is the win-probability the mover gives up by
+/// taking the heuristic's move instead of the optimal one. States are drawn
+/// either uniformly over the table or from optimal-vs-optimal play; the two
+/// distributions answer different questions and often disagree.
+fn regret_report(
+    model: &Path,
+    output_dir: &Path,
+    samples: usize,
+    on_policy: bool,
+    seed: u64,
+    dump_features: bool,
+    fitted_weights: Option<&Path>,
+) {
+    let lut = Lut::read(model);
+    fs::create_dir_all(output_dir).unwrap();
+    let distribution = if on_policy { "onpolicy" } else { "uniform" };
+
+    // Collect the states to score.
+    let mut rng = SplitMix64::new(seed);
+    let mut states = Vec::with_capacity(samples);
+    if on_policy {
+        let mut moves = [0i8; 8];
+        while states.len() < samples {
+            let mut game = Game::initial(lut.rules);
+            let mut plies = 0usize;
+            while !game.finished && states.len() < samples {
+                plies += 1;
+                assert!(plies < 100_000);
+                let roll = lut.rules.roll(&mut rng);
+                let count = game.apply_roll(roll, &mut moves);
+                if count == 0 {
+                    continue;
+                }
+                if count > 1 {
+                    states.push(game.clone());
+                }
+                let source = choose_optimal_move(&lut, &game, &moves[..count]);
+                game.apply_move(source, lut.rules);
+            }
+        }
+    } else {
+        let mut moves = [0i8; 8];
+        while states.len() < samples {
+            let (key, _) = lut.key_value_at_global(rng.index(lut.total));
+            let mut game = lut.encoding.decode(key);
+            if game.finished {
+                continue;
+            }
+            // Give the position a roll so there is a decision to make.
+            let roll = lut.rules.roll(&mut rng);
+            let count = game.apply_roll(roll, &mut moves);
+            if count > 1 {
+                states.push(game);
+            }
+        }
+    }
+    eprintln!("collected {} decision states ({distribution})", states.len());
+
+    let mut summary = BufWriter::new(
+        File::create(output_dir.join(format!("{}_regret_{distribution}.csv", lut.rules.name())))
+            .unwrap(),
+    );
+    writeln!(summary, "heuristic,states,mean_regret,p95_regret,max_regret,agreement_pct").unwrap();
+
+    // (name, weights); None means uniformly random move choice.
+    let path_len = lut.rules.light_path().len() as f64;
+    let mut ladder: Vec<(String, Option<[f64; FEATURE_COUNT]>)> = Heuristic::all()
+        .iter()
+        .map(|h| {
+            let weights = if *h == Heuristic::Random { None } else { Some(h.weights(path_len)) };
+            (h.name().to_string(), weights)
+        })
+        .collect();
+    // Weights fitted offline by scripts/fit_heuristic.py, one float per line in
+    // FEATURE_NAMES order. This closes the loop: dump features, fit, feed back.
+    if let Some(path) = fitted_weights {
+        let text = fs::read_to_string(path).expect("failed to read weights file");
+        let values: Vec<f64> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.parse::<f64>().expect("weights must be one float per line"))
+            .collect();
+        assert_eq!(
+            values.len(),
+            FEATURE_COUNT,
+            "expected {FEATURE_COUNT} weights in {}, found {}",
+            path.display(),
+            values.len()
+        );
+        let mut weights = [0.0; FEATURE_COUNT];
+        weights.copy_from_slice(&values);
+        ladder.push(("fitted".to_string(), Some(weights)));
+    }
+
+    let mut moves = [0i8; 8];
+    for (name, weights) in &ladder {
+        let mut regrets = Vec::with_capacity(states.len());
+        let mut agree = 0usize;
+        let mut choice_rng = SplitMix64::new(seed ^ 0x5bd1_e995);
+        for game in &states {
+            let count = game.available_moves(&mut moves);
+            debug_assert!(count > 1);
+            let best = choose_optimal_move(&lut, game, &moves[..count]);
+            let picked = choose_move_with(weights.as_ref(), &lut, game, &moves[..count], &mut choice_rng);
+            let value_of = |source: i8| {
+                let mut next = game.clone();
+                next.apply_move(source, lut.rules);
+                let light = lut.light_win_percent(&next);
+                if game.is_light_turn { light } else { 100.0 - light }
+            };
+            let regret = (value_of(best) - value_of(picked)).max(0.0);
+            if regret == 0.0 {
+                agree += 1;
+            }
+            regrets.push(regret);
+        }
+        regrets.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = regrets.iter().sum::<f64>() / regrets.len() as f64;
+        let p95 = regrets[(regrets.len() as f64 * 0.95) as usize % regrets.len()];
+        let max = *regrets.last().unwrap();
+        let agreement = 100.0 * agree as f64 / regrets.len() as f64;
+        writeln!(
+            summary,
+            "{},{},{mean:.6},{p95:.6},{max:.6},{agreement:.4}",
+            name,
+            regrets.len()
+        )
+        .unwrap();
+        eprintln!(
+            "{:>12}: mean_regret={mean:.4} p95={p95:.4} max={max:.4} agreement={agreement:.2}%",
+            name
+        );
+    }
+    summary.flush().unwrap();
+
+    // Feature matrix plus exact values, for fitting a linear model offline.
+    if dump_features {
+        let path = output_dir.join(format!("{}_features_{distribution}.csv", lut.rules.name()));
+        let mut file = BufWriter::new(File::create(&path).unwrap());
+        writeln!(file, "{},value_mover", FEATURE_NAMES.join(",")).unwrap();
+        for game in &states {
+            let f = features(&lut, game);
+            let light = lut.light_win_percent(game);
+            let mover = if game.is_light_turn { light } else { 100.0 - light };
+            let row: Vec<String> = f.iter().map(|v| format!("{v:.6}")).collect();
+            writeln!(file, "{},{mover:.9}", row.join(",")).unwrap();
+        }
+        file.flush().unwrap();
+        eprintln!("wrote feature matrix to {}", path.display());
+    }
+}
+
 fn usage() -> ! {
     eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis simulate <model.rgu> <output-dir> <label> [compare-states] [games-per-state] [games-per-epsilon] [shard-seed]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>");
     std::process::exit(2);
@@ -2343,6 +2899,28 @@ fn main() {
     if command == "preflight-train" {
         let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
         preflight_training(&model, samples);
+        return;
+    }
+    if command == "stage-curve" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let games = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+        let seed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x2f6e_1c33_a7d5_04b9);
+        stage_curve(&model, &output, games, seed);
+        return;
+    }
+    if command == "regret" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output_dir = PathBuf::from(&args[3]);
+        let samples = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(200_000);
+        let on_policy = matches!(args.get(5).map(String::as_str), Some("onpolicy"));
+        let seed = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0x71c3_9a5e_2b84_16df);
+        let weights_path = args.get(7).map(PathBuf::from);
+        regret_report(&model, &output_dir, samples, on_policy, seed, true, weights_path.as_deref());
         return;
     }
     if command == "simulate" {
