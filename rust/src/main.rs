@@ -2810,6 +2810,162 @@ fn feature_gram(model: &Path, output: &Path) {
     );
 }
 
+/// Accumulate the *within-position centred* normal equations over every
+/// decision in the map: every stored state, every roll that offers a choice.
+///
+/// This is the ordering counterpart of `feature_gram`. Subtracting each
+/// position's mean from the design and target annihilates whatever is constant
+/// across that position's sibling moves -- exactly the part that cannot affect
+/// which move is chosen -- so the resulting fit targets move ordering rather
+/// than value accuracy.
+///
+/// Reflection is folded in linearly. With `s = 1 - 2 * passed`, a successor's
+/// mover-relative score is `s * (f . w) + s * b + 100 * passed`, so signing the
+/// features by `s`, appending `s` as the intercept column, and moving the known
+/// `100 * passed` to the target keeps the whole thing least squares.
+///
+/// Each decision is weighted by its roll probability, so a position that arises
+/// from a 1-in-16 roll does not count the same as one from a 6-in-16 roll.
+fn ordering_gram(model: &Path, output: &Path, stride: usize) {
+    let lut = Lut::read(model);
+    let columns = FEATURE_COUNT + 1;
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let chunk = (lut.total + threads - 1) / threads;
+    let started = Instant::now();
+
+    let partials: Vec<(Vec<f64>, Vec<f64>, f64, usize, f64)> = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for thread_index in 0..threads {
+            let begin = thread_index * chunk;
+            let end = (begin + chunk).min(lut.total);
+            let lut = &lut;
+            handles.push(scope.spawn(move || {
+                let mut xtx = vec![0.0f64; columns * columns];
+                let mut xty = vec![0.0f64; columns];
+                let mut yty = 0.0f64;
+                let mut decisions = 0usize;
+                let mut weight_total = 0.0f64;
+
+                let mut moves = [0i8; 8];
+                let mut design = vec![0.0f64; 8 * columns];
+                let mut targets = [0.0f64; 8];
+
+                let mut global = begin;
+                while global < end {
+                    let (key, _) = lut.key_value_at_global(global);
+                    global += stride;
+                    let base = lut.encoding.decode(key);
+                    if base.finished {
+                        continue;
+                    }
+                    for (roll, &probability) in lut.rules.roll_probabilities().iter().enumerate() {
+                        if probability == 0.0 {
+                            continue;
+                        }
+                        let mut rolled = base.clone();
+                        let count = rolled.apply_roll(roll as u8, &mut moves);
+                        if count < 2 {
+                            continue; // no choice to make, so nothing to order
+                        }
+                        let mover_is_light = rolled.is_light_turn;
+                        for (index, &source) in moves[..count].iter().enumerate() {
+                            let mut next = rolled.clone();
+                            next.apply_move(source, lut.rules);
+                            let passed = next.is_light_turn != mover_is_light;
+                            let sign = if passed { -1.0 } else { 1.0 };
+                            let light = lut.light_win_percent(&next);
+                            let value = if mover_is_light { light } else { 100.0 - light };
+                            let row = &mut design[index * columns..(index + 1) * columns];
+                            if next.finished {
+                                row[..FEATURE_COUNT].fill(0.0);
+                            } else {
+                                for (slot, value) in
+                                    row[..FEATURE_COUNT].iter_mut().zip(features(lut, &next))
+                                {
+                                    *slot = sign * value;
+                                }
+                            }
+                            row[FEATURE_COUNT] = sign;
+                            targets[index] = value - if passed { 100.0 } else { 0.0 };
+                        }
+
+                        // Centre within this position.
+                        let inverse = 1.0 / count as f64;
+                        let mut mean_row = vec![0.0f64; columns];
+                        let mut mean_target = 0.0f64;
+                        for index in 0..count {
+                            for column in 0..columns {
+                                mean_row[column] += design[index * columns + column] * inverse;
+                            }
+                            mean_target += targets[index] * inverse;
+                        }
+                        for index in 0..count {
+                            let row = &design[index * columns..(index + 1) * columns];
+                            let y = targets[index] - mean_target;
+                            for i in 0..columns {
+                                let a = row[i] - mean_row[i];
+                                if a == 0.0 {
+                                    continue;
+                                }
+                                xty[i] += probability * a * y;
+                                for j in i..columns {
+                                    xtx[i * columns + j] += probability * a * (row[j] - mean_row[j]);
+                                }
+                            }
+                            yty += probability * y * y;
+                        }
+                        decisions += 1;
+                        weight_total += probability;
+                    }
+                }
+                (xtx, xty, yty, decisions, weight_total)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut xtx = vec![0.0f64; columns * columns];
+    let mut xty = vec![0.0f64; columns];
+    let mut yty = 0.0f64;
+    let mut decisions = 0usize;
+    let mut weight_total = 0.0f64;
+    for (a, b, c, n, w) in partials {
+        for i in 0..columns * columns {
+            xtx[i] += a[i];
+        }
+        for i in 0..columns {
+            xty[i] += b[i];
+        }
+        yty += c;
+        decisions += n;
+        weight_total += w;
+    }
+    for i in 0..columns {
+        for j in 0..i {
+            xtx[i * columns + j] = xtx[j * columns + i];
+        }
+    }
+
+    let mut file = BufWriter::new(File::create(output).unwrap());
+    writeln!(file, "# within-position centred normal equations over every decision").unwrap();
+    writeln!(file, "# columns: {},intercept", FEATURE_NAMES.join(",")).unwrap();
+    writeln!(file, "rows,{decisions}").unwrap();
+    writeln!(file, "weight,{weight_total:.10e}").unwrap();
+    writeln!(file, "yty,{yty:.10e}").unwrap();
+    for i in 0..columns {
+        let row: Vec<String> = (0..columns).map(|j| format!("{:.10e}", xtx[i * columns + j])).collect();
+        writeln!(file, "xtx,{}", row.join(",")).unwrap();
+    }
+    let row: Vec<String> = xty.iter().map(|v| format!("{v:.10e}")).collect();
+    writeln!(file, "xty,{}", row.join(",")).unwrap();
+    file.flush().unwrap();
+    eprintln!(
+        "accumulated {decisions} decisions (stride {stride}) in {:.1}s -> {}",
+        started.elapsed().as_secs_f64(),
+        output.display()
+    );
+}
+
 /// Index of a state's score layer in the order the solver completes them.
 fn layer_index_of(lut: &Lut, game: &Game, pair_to_index: &[usize]) -> usize {
     let low = game.light_score.min(game.dark_score) as usize;
@@ -3109,6 +3265,15 @@ fn main() {
     if command == "preflight-train" {
         let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
         preflight_training(&model, samples);
+        return;
+    }
+    if command == "ordering-gram" {
+        if args.len() < 4 {
+            usage();
+        }
+        // stride 1 walks every state; a larger stride subsamples for a quick look.
+        let stride = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1);
+        ordering_gram(&model, Path::new(&args[3]), stride);
         return;
     }
     if command == "feature-gram" {
