@@ -29,3 +29,16 @@ Manifest.toml
 
 # Vendored BayesElo build (see analysis/bayeselo_readme.txt).
 BayesElo
+
+# The manuscript is deliberately not in this repository. Once the revision is
+# resubmitted, the final PDF and its figures can be added on purpose; the LaTeX
+# sources and build artefacts stay out.
+paper/
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+*.out
