@@ -1,0 +1,17 @@
+# fitted by scripts/fit_heuristic.py, one weight per line
+# order: advancement_self,advancement_opp,scored_self,scored_opp,hand_self,hand_opp,safe_self,safe_opp,exposure_self,threat_self,centre_self,centre_opp,frontmost_self,frontmost_opp,intercept
+0.4283161871
+-0.5156530120
+9.3271318339
+-12.0256139589
+-0.7586268063
+-1.1545792898
+0.0558913842
+-0.9643359119
+-0.0088047075
+0.9057782644
+3.9323261140
+-5.6037920542
+0.2897146441
+-0.3117610265
+62.9415201756

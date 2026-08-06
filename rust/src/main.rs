@@ -2810,6 +2810,190 @@ fn feature_gram(model: &Path, output: &Path) {
     );
 }
 
+/// Expectimax over dice, with a heuristic at the leaves.
+///
+/// Chance nodes are the rolls, so this averages over rolls and takes the best
+/// (or worst, for the opponent) move at each decision. Depth counts plies of
+/// move choice; depth 0 evaluates the position directly, which is what the
+/// 1-ply greedy policy does.
+fn expectimax_light(
+    weights: Option<&[f64; WEIGHT_COUNT]>,
+    lut: &Lut,
+    game: &Game,
+    depth: usize,
+    rng: &mut SplitMix64,
+) -> f64 {
+    if game.finished {
+        return if game.light_score >= lut.rules.pieces() { 100.0 } else { 0.0 };
+    }
+    if depth == 0 {
+        return heuristic_light_value(weights, lut, game, rng);
+    }
+    let mut moves = [0i8; 8];
+    let mut total = 0.0;
+    for (roll, &probability) in lut.rules.roll_probabilities().iter().enumerate() {
+        if probability == 0.0 {
+            continue;
+        }
+        let mut rolled = game.clone();
+        let count = rolled.apply_roll(roll as u8, &mut moves);
+        let value = if count == 0 {
+            // No legal move: the turn simply passes, which is not a decision, so
+            // it does not consume a ply.
+            expectimax_light(weights, lut, &rolled, depth - 1, rng)
+        } else {
+            let light_turn = rolled.is_light_turn;
+            let mut best = if light_turn { f64::NEG_INFINITY } else { f64::INFINITY };
+            for &source in &moves[..count] {
+                let mut next = rolled.clone();
+                next.apply_move(source, lut.rules);
+                let value = expectimax_light(weights, lut, &next, depth - 1, rng);
+                if light_turn {
+                    if value > best {
+                        best = value;
+                    }
+                } else if value < best {
+                    best = value;
+                }
+            }
+            best
+        };
+        total += probability * value;
+    }
+    total
+}
+
+/// Regret of a weighted heuristic as a function of search depth.
+///
+/// Depth 1 is the greedy policy used everywhere else: evaluate each successor
+/// with the heuristic. Deeper searches average over the opponent's roll and
+/// reply before evaluating, so a weak evaluator can compensate with lookahead.
+fn depth_regret(
+    model: &Path,
+    output: &Path,
+    samples: usize,
+    max_depth: usize,
+    weights_path: Option<&Path>,
+    seed: u64,
+) {
+    let lut = Lut::read(model);
+    let weights = weights_path.map(|path| {
+        let text = fs::read_to_string(path).expect("failed to read weights");
+        let values: Vec<f64> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.parse::<f64>().expect("weights must be one float per line"))
+            .collect();
+        assert_eq!(values.len(), WEIGHT_COUNT, "expected {WEIGHT_COUNT} weights");
+        let mut array = [0.0; WEIGHT_COUNT];
+        array.copy_from_slice(&values);
+        array
+    });
+
+    // Sample decision states from optimal play.
+    let mut rng = SplitMix64::new(seed);
+    let mut states = Vec::with_capacity(samples);
+    let mut moves = [0i8; 8];
+    let mut game = Game::initial(lut.rules);
+    while states.len() < samples {
+        if game.finished {
+            game = Game::initial(lut.rules);
+        }
+        let roll = lut.rules.roll(&mut rng);
+        let count = game.apply_roll(roll, &mut moves);
+        if count == 0 {
+            continue;
+        }
+        if count > 1 {
+            states.push(game.clone());
+        }
+        let source = choose_optimal_move(&lut, &game, &moves[..count]);
+        game.apply_move(source, lut.rules);
+    }
+
+    let mut file = BufWriter::new(File::create(output).unwrap());
+    writeln!(file, "heuristic,depth,states,mean_regret,agreement_pct,seconds").unwrap();
+
+    let named: Vec<(String, Option<[f64; WEIGHT_COUNT]>)> = {
+        let mut list: Vec<(String, Option<[f64; WEIGHT_COUNT]>)> = vec![
+            ("advancement".into(), Some(Heuristic::Advancement.weights(lut.rules.light_path().len() as f64))),
+            ("composite".into(), Some(Heuristic::Composite.weights(lut.rules.light_path().len() as f64))),
+        ];
+        if let Some(w) = weights {
+            list.push(("fitted".into(), Some(w)));
+        }
+        list
+    };
+
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    for (name, weight) in &named {
+        for depth in 1..=max_depth {
+            let started = Instant::now();
+            let chunk = (states.len() + threads - 1) / threads;
+            let (regret_sum, agree): (f64, usize) = thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for part in states.chunks(chunk.max(1)) {
+                    let lut = &lut;
+                    handles.push(scope.spawn(move || {
+                        let mut rng = SplitMix64::new(0x9e37_79b9);
+                        let mut moves = [0i8; 8];
+                        let mut sum = 0.0;
+                        let mut agree = 0usize;
+                        for game in part {
+                            let count = game.available_moves(&mut moves);
+                            let best = choose_optimal_move(lut, game, &moves[..count]);
+                            let light_turn = game.is_light_turn;
+                            let mut picked = moves[0];
+                            let mut best_score =
+                                if light_turn { f64::NEG_INFINITY } else { f64::INFINITY };
+                            for &source in &moves[..count] {
+                                let mut next = game.clone();
+                                next.apply_move(source, lut.rules);
+                                let value = expectimax_light(
+                                    weight.as_ref(), lut, &next, depth - 1, &mut rng,
+                                );
+                                let better = if light_turn { value > best_score } else { value < best_score };
+                                if better {
+                                    best_score = value;
+                                    picked = source;
+                                }
+                            }
+                            let value_of = |source: i8| {
+                                let mut next = game.clone();
+                                next.apply_move(source, lut.rules);
+                                let light = lut.light_win_percent(&next);
+                                if light_turn { light } else { 100.0 - light }
+                            };
+                            let regret = (value_of(best) - value_of(picked)).max(0.0);
+                            if regret == 0.0 {
+                                agree += 1;
+                            }
+                            sum += regret;
+                        }
+                        (sum, agree)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .fold((0.0, 0), |acc, item| (acc.0 + item.0, acc.1 + item.1))
+            });
+            let mean = regret_sum / states.len() as f64;
+            let agreement = 100.0 * agree as f64 / states.len() as f64;
+            let seconds = started.elapsed().as_secs_f64();
+            writeln!(
+                file,
+                "{name},{depth},{},{mean:.6},{agreement:.4},{seconds:.2}",
+                states.len()
+            )
+            .unwrap();
+            eprintln!("{name:>12} depth={depth}: mean_regret={mean:.4} agreement={agreement:.2}% ({seconds:.1}s)");
+        }
+    }
+    file.flush().unwrap();
+}
+
 /// Accumulate the *within-position centred* normal equations over every
 /// decision in the map: every stored state, every roll that offers a choice.
 ///
@@ -3265,6 +3449,18 @@ fn main() {
     if command == "preflight-train" {
         let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
         preflight_training(&model, samples);
+        return;
+    }
+    if command == "depth-regret" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let samples = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5_000);
+        let max_depth = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(3);
+        let weights = args.get(6).map(PathBuf::from);
+        let seed = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(0x51ed_270b_44c9_0af3);
+        depth_regret(&model, &output, samples, max_depth, weights.as_deref(), seed);
         return;
     }
     if command == "ordering-gram" {
