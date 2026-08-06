@@ -2810,6 +2810,143 @@ fn feature_gram(model: &Path, output: &Path) {
     );
 }
 
+const MOVE_FEATURE_COUNT: usize = 12;
+const MOVE_FEATURE_NAMES: [&str; MOVE_FEATURE_COUNT] = [
+    "advance", "captures", "scores", "enters", "lands_rosette", "lands_centre",
+    "leaves_centre", "dest_safe", "src_was_exposed", "delta_exposure",
+    "delta_threat", "keeps_turn",
+];
+
+/// Features of the *move* rather than of the resulting position.
+///
+/// The within-position centring result says only what differs between sibling
+/// moves can affect which is chosen. Move features are that difference by
+/// construction: every one of them varies across the candidates of a position,
+/// where a state feature like `scored_self` is usually identical for all of
+/// them. `captures`, `scores` and `enters` in particular are properties of the
+/// transition that no function of the successor position alone recovers.
+fn move_features(
+    lut: &Lut,
+    rolled: &Game,
+    source: i8,
+    roll: usize,
+    next: &Game,
+) -> [f64; MOVE_FEATURE_COUNT] {
+    let mover_is_light = rolled.is_light_turn;
+    let sign = rolled.turn_sign();
+    let path = if mover_is_light { lut.rules.light_path() } else { lut.rules.dark_path() };
+    let destination_index = source as isize + roll as isize;
+    let scores = destination_index >= path.len() as isize;
+    let destination = if scores { usize::MAX } else { path[destination_index as usize] };
+
+    let captures = !scores && {
+        let occupant = rolled.board[destination];
+        occupant != 0 && occupant * sign < 0
+    };
+    let opponent_path = if mover_is_light { lut.rules.dark_path() } else { lut.rules.light_path() };
+    let destination_safe = !scores && !opponent_path.contains(&destination);
+    let turn_passed = next.is_light_turn != mover_is_light;
+
+    // Exposure of the mover's pieces, and the mover's own capture chances,
+    // after the move. Which argument to capture_probability depends on whose
+    // turn it now is.
+    let exposure_before = capture_probability(lut, rolled, false);
+    let threat_before = capture_probability(lut, rolled, true);
+    let (exposure_after, threat_after) = if next.finished {
+        (0.0, 0.0)
+    } else {
+        (
+            capture_probability(lut, next, turn_passed),
+            capture_probability(lut, next, !turn_passed),
+        )
+    };
+
+    let source_tile = if source >= 0 { Some(path[source as usize]) } else { None };
+    let source_was_exposed = source_tile
+        .map(|tile| opponent_path.contains(&tile) && !(lut.rules.safe_rosettes() && ROSETTES.contains(&tile)))
+        .unwrap_or(false);
+
+    [
+        roll as f64,
+        f64::from(captures),
+        f64::from(scores),
+        f64::from(source < 0),
+        f64::from(!scores && ROSETTES.contains(&destination)),
+        f64::from(!scores && destination == CENTRE_ROSETTE),
+        f64::from(source_tile == Some(CENTRE_ROSETTE)),
+        f64::from(destination_safe),
+        f64::from(source_was_exposed),
+        exposure_after - exposure_before,
+        threat_after - threat_before,
+        f64::from(!turn_passed),
+    ]
+}
+
+/// Dump every candidate move with BOTH state features and move features, plus
+/// its exact value, so competing policy families can be fitted and compared
+/// offline on identical data.
+fn dump_move_features(model: &Path, output: &Path, samples: usize, seed: u64) {
+    let lut = Lut::read(model);
+    let mut rng = SplitMix64::new(seed);
+    let mut file = BufWriter::new(File::create(output).unwrap());
+    writeln!(
+        file,
+        "state,move,turn_passed,value_mover,{},{}",
+        FEATURE_NAMES.join(","),
+        MOVE_FEATURE_NAMES.join(",")
+    )
+    .unwrap();
+
+    let mut moves = [0i8; 8];
+    let mut game = Game::initial(lut.rules);
+    let mut positions = 0usize;
+    while positions < samples {
+        if game.finished {
+            game = Game::initial(lut.rules);
+        }
+        let roll = lut.rules.roll(&mut rng) as usize;
+        let count = game.apply_roll(roll as u8, &mut moves);
+        if count == 0 {
+            continue;
+        }
+        let snapshot = game.clone();
+        let chosen = choose_optimal_move(&lut, &game, &moves[..count]);
+        game.apply_move(chosen, lut.rules);
+        if count < 2 {
+            continue;
+        }
+
+        let mover_is_light = snapshot.is_light_turn;
+        for (index, &source) in moves[..count].iter().enumerate() {
+            let mut next = snapshot.clone();
+            next.apply_move(source, lut.rules);
+            let passed = next.is_light_turn != mover_is_light;
+            let light = lut.light_win_percent(&next);
+            let value = if mover_is_light { light } else { 100.0 - light };
+            let state_row: Vec<String> = if next.finished {
+                vec!["0".into(); FEATURE_COUNT]
+            } else {
+                features(&lut, &next).iter().map(|v| format!("{v:.4}")).collect()
+            };
+            let move_row: Vec<String> = move_features(&lut, &snapshot, source, roll, &next)
+                .iter()
+                .map(|v| format!("{v:.4}"))
+                .collect();
+            writeln!(
+                file,
+                "{positions},{index},{},{value:.9},{},{}",
+                u8::from(passed),
+                state_row.join(","),
+                move_row.join(",")
+            )
+            .unwrap();
+        }
+        positions += 1;
+    }
+    file.flush().unwrap();
+    eprintln!("wrote {positions} positions to {}", output.display());
+}
+
 /// Expectimax over dice, with a heuristic at the leaves.
 ///
 /// Chance nodes are the rolls, so this averages over rolls and takes the best
@@ -3449,6 +3586,16 @@ fn main() {
     if command == "preflight-train" {
         let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
         preflight_training(&model, samples);
+        return;
+    }
+    if command == "dump-move-features" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let samples = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50_000);
+        let seed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x6b2f_9e11_c40d_7a35);
+        dump_move_features(&model, &output, samples, seed);
         return;
     }
     if command == "depth-regret" {
