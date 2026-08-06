@@ -94,20 +94,39 @@ expressed in squares of advancement:
 
 ## 5. The fitted linear model is the strongest heuristic
 
-Mean move regret in win-probability points, on-policy states (Finkel, 40,000
-states):
+Mean move regret in win-probability points, 200,000 on-policy states per rule
+set, corrected code:
 
-| Heuristic | mean regret | move agreement |
-| --- | --- | --- |
-| random | 2.200 | 36.6% |
-| advancement | 0.902 | 54.2% |
-| centre | 0.576 | 60.1% |
-| composite (hand-tuned) | 0.625 | 61.4% |
-| **fitted (least squares)** | **0.535** | **62.2%** |
+| Heuristic | Blitz | Finkel | Masters |
+| --- | --- | --- | --- |
+| random | 1.685 | 2.177 | 1.117 |
+| advancement | 1.224 | 0.905 | 0.650 |
+| score_race | 0.993 | 0.901 | 0.588 |
+| safety | 0.595 | 0.891 | 0.493 |
+| centre | 0.534 | 0.584 | 0.429 |
+| exposure | **0.502** | 0.640 | **0.428** |
+| composite | 0.521 | 0.626 | 0.465 |
+| fitted (least squares) | 0.533 | **0.526** | 0.525 |
 
-So twelve-odd features fitted by ordinary least squares beat every hand-tuned
-weighting, and give up about a quarter of a win-probability point per move
-against perfect play.
+Move agreement (fraction of positions where the optimal move is chosen) tells a
+different story: the fitted model is **highest everywhere** — 68.7% on blitz,
+62.3% on Finkel, 60.8% on Masters — while `exposure` leads on mean regret for
+blitz and Masters.
+
+So the fitted model picks the best move most often, but when it errs it errs by
+more. That is expected: least squares on values optimises neither agreement nor
+regret directly. It is the cleanest remaining evidence for the theoretical point
+that squared value error is not the loss that governs move choice, and motivates
+the within-position centred fit.
+
+A good heuristic gives up roughly half a win-probability point per move against
+perfect play, against 1.1-2.2 for random.
+
+Caveat on the ladder: `lead` currently reports identically to `advancement` on
+all three rule sets. The definitions do differ (`lead` adds a pieces-in-hand
+term) but they can only disagree when entering a piece ties exactly against a
+two-square move, so it is a redundant rung and should be replaced with a more
+distinct feature combination.
 
 **Retraction.** An earlier version of this note claimed the opposite — that the
 fitted model was a *worse* move chooser than plain advancement, and drew a
