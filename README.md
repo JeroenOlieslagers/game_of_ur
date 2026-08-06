@@ -40,8 +40,14 @@ python scripts/download_models.py finkel            # fetch a published map
 cargo build --release --manifest-path rust/Cargo.toml
 
 rust/target/release/royalur_analysis train-f64 \
-    models/finkel.rgu models/finkel_f64_ours.rgu 3e-14 10000 precomputed-gauss-seidel
+    models/finkel.rgu models/finkel_f64_ours.rgu 3e-14 10000 \
+    precomputed-gauss-seidel naive
 ```
+
+The last argument chooses where iteration starts. `naive` takes only the state
+keys from the input map and sets every value to 50%, which is a solve from
+scratch; `published` instead refines the map's existing Percent16 values. Both
+converge to the same fixed point — see [Measured runtimes](#measured-runtimes).
 
 Rule sets are `finkel`, `blitz` and `masters`; the solver identifies which one a
 map is from its embedded metadata. Verify a finished map, and compare two
@@ -186,8 +192,8 @@ refuses to run on a mismatch.
 
 ## Measured runtimes
 
-Solving each rule set from its published Percent16 map down to a residual of
-`3e-14`, using `precomputed-gauss-seidel`.
+Solving each rule set to a residual of `3e-14`, using
+`precomputed-gauss-seidel`.
 
 Hardware: one node of the NYU Torch cluster — Intel Xeon Platinum 8592+, 2
 sockets x 64 cores (128 logical CPUs), 503 GiB RAM, glibc 2.34. Each job used
@@ -196,17 +202,38 @@ runs.
 
 | Rule set | States | Score layers | Solve time | Output map | First player wins | Final residual |
 | --- | --- | --- | --- | --- | --- | --- |
-| Blitz | 41,254,034 | 15 | **26.8 s** | 0.495 GB | 50.4052555093% | 2.842170943040e-14 |
-| Finkel | 137,892,016 | 28 | **223.2 s** | 1.655 GB | 51.5404732509% | 2.842170943040e-14 |
-| Masters | 500,981,472 | 28 | **880.9 s** | 6.012 GB | 50.4809002027% | 2.842170943040e-14 |
+| Blitz | 41,254,034 | 15 | **31.5 s** | 0.495 GB | 50.4052555093% | 2.842170943040e-14 |
+| Finkel | 137,892,016 | 28 | **200.5 s** | 1.655 GB | 51.5404732509% | 2.842170943040e-14 |
+| Masters | 500,981,472 | 28 | **884.1 s** | 6.012 GB | 50.4809002027% | 2.842170943040e-14 |
 
-For scale on the Masters run, the largest rule set: its last score layer holds
-18,746,644 states and converged in 103 sweeps at 0.97 s per sweep. End to end the
-job took 15 min 13 s of wall clock, including building the solver, reading the
-3 GB input map, writing the 6 GB output and verifying it.
+These are `naive` solves: only the published maps' *state keys* are used, and
+every value starts at a flat 50%. No prior solution is involved.
 
 Runtime is the solve itself, excluding reading the input map and writing the
-output.
+output. For scale on Masters, the largest rule set: its last score layer holds
+18,746,644 states and converged in 137 sweeps at about 1 s per sweep.
+
+### Refining an existing solution costs about the same
+
+The solver can also start from the published Percent16 values, whose residual is
+already about `1e-3`, and refine them (`published`, the other `init` argument).
+That does far less work in principle, but is barely faster in practice:
+
+| Rule set | From scratch | Refining published values | Ratio |
+| --- | --- | --- | --- |
+| Blitz | 31.5 s | 26.8 s | 1.18x |
+| Finkel | 200.5 s | 223.2 s | 0.90x |
+| Masters | 884.1 s | 880.9 s | 1.00x |
+
+Convergence is geometric, so starting four orders of magnitude further from the
+solution costs a constant number of extra sweeps rather than a multiple of the
+work: on Masters' last layer, 137 sweeps instead of 103. The remaining
+differences are within node-to-node variation, which is why Finkel came out
+faster from scratch.
+
+Both initialisations reach the same fixed point. All three rule sets agree on the
+start-position value to all ten printed digits between the two runs, which is
+what a contraction mapping should do regardless of where it starts.
 
 ### Core count
 
