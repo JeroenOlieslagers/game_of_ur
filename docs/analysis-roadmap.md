@@ -161,6 +161,46 @@ engineering. Fit on **on-policy** states; fitting on uniform samples tunes the
 weights to positions nobody reaches. Consider fitting to move ordering (rank or
 regret) rather than value, since ordering is what determines play.
 
+### What belongs in stage 1, and what does not
+
+Stage 1 compares model families at **fixed, small capacity**, where the question
+is which *features and structures* carry the signal. Any model whose capacity can
+simply be turned up until it memorises belongs in stage 2 instead, because there
+the interesting question is the capacity/accuracy trade-off rather than the
+features.
+
+By that test:
+
+- **Stage 1:** hand-tuned weights, linear on state features, linear on move
+  features, linear with pairwise interactions, decision lists, and an N-tuple
+  network at one small fixed bank size.
+- **Stage 2:** gradient boosting, neural networks, and the N-tuple *capacity
+  sweep*. All three sit on the same rate-distortion curve.
+
+A consequence for protocol: at fixed small capacity (15-100 weights against
+~180,000 rows) in-sample and held-out regret coincide, so no holdout is needed
+and none is used. For a scalable model a holdout is essential or the number
+measures memorisation. That difference in protocol is exactly why the two
+families should not share a table.
+
+### Search depth applies to position evaluators only
+
+Depth is a second axis, but it does not apply uniformly:
+
+- **Position evaluators** -- state features, interactions, N-tuple -- can sit at
+  the leaves of an expectimax search, so depth sweeps naturally.
+- **Move-based policies** -- move features, decision lists -- score a
+  *transition*, not a position. At depth greater than one the leaves are
+  positions, about which such a model has nothing to say, so they are inherently
+  root-only. A hybrid (move features at the root, a position evaluator at the
+  leaves) is possible but is a third thing, not a depth sweep of the same model.
+
+Depth and evaluator quality are substitutes, so rankings can invert with depth:
+`advancement` at depth 2 already beats `composite` at depth 1. A depth-1-only
+comparison can therefore mislead about which evaluator to deploy with search.
+Sweep depth after the fixed-depth comparison settles, and only for the position
+evaluators.
+
 ## Stage 2 — neural network compression of the lookup table
 
 Frame this as **rate-distortion**: parameters against error. The headline is a

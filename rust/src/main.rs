@@ -2891,7 +2891,7 @@ fn dump_move_features(model: &Path, output: &Path, samples: usize, seed: u64) {
     let mut file = BufWriter::new(File::create(output).unwrap());
     writeln!(
         file,
-        "state,move,turn_passed,value_mover,{},{}",
+        "state,move,turn_passed,value_mover,occupancy,{},{}",
         FEATURE_NAMES.join(","),
         MOVE_FEATURE_NAMES.join(",")
     )
@@ -2932,9 +2932,34 @@ fn dump_move_features(model: &Path, output: &Path, samples: usize, seed: u64) {
                 .iter()
                 .map(|v| format!("{v:.4}"))
                 .collect();
+            // Occupancy along the mover's own path, one character per path
+            // position: 0 empty, 1 the player to move in `next`, 2 the other.
+            // This is what an N-tuple network indexes into, and it is written
+            // from the same perspective as the features so the reflection
+            // handles both consistently.
+            let occupancy: String = {
+                let path = if next.is_light_turn {
+                    lut.rules.light_path()
+                } else {
+                    lut.rules.dark_path()
+                };
+                let sign = if next.is_light_turn { 1i8 } else { -1i8 };
+                path.iter()
+                    .map(|&tile| {
+                        let piece = next.board[tile];
+                        if piece == 0 {
+                            '0'
+                        } else if piece * sign > 0 {
+                            '1'
+                        } else {
+                            '2'
+                        }
+                    })
+                    .collect()
+            };
             writeln!(
                 file,
-                "{positions},{index},{},{value:.9},{},{}",
+                "{positions},{index},{},{value:.9},{occupancy},{},{}",
                 u8::from(passed),
                 state_row.join(","),
                 move_row.join(",")
