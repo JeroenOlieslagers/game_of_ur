@@ -92,36 +92,53 @@ expressed in squares of advancement:
   square
 - an available capture: +7; being exposed to capture: -1.4
 
-## 5. Fitting values is the wrong objective for choosing moves
+## 5. The fitted linear model is the strongest heuristic
 
-The finding most worth reporting, because it is counterintuitive: the fitted
-model, despite explaining ~90% of the variance, is a **worse** move chooser than
-plain advancement.
+Mean move regret in win-probability points, on-policy states (Finkel, 40,000
+states):
 
-Mean move regret in win-probability points, 200,000 on-policy states:
+| Heuristic | mean regret | move agreement |
+| --- | --- | --- |
+| random | 2.200 | 36.6% |
+| advancement | 0.902 | 54.2% |
+| centre | 0.576 | 60.1% |
+| composite (hand-tuned) | 0.625 | 61.4% |
+| **fitted (least squares)** | **0.535** | **62.2%** |
 
-| Rule set | best heuristic | `advancement` | least-squares `fitted` |
-| --- | --- | --- | --- |
-| Blitz | composite **0.278** | 0.612 | 1.285 |
-| Finkel | advancement **0.546** | 0.546 | 0.634 |
-| Masters | composite **0.301** | 0.344 | 0.832 |
+So twelve-odd features fitted by ordinary least squares beat every hand-tuned
+weighting, and give up about a quarter of a win-probability point per move
+against perfect play.
 
-The explanation: the terms that dominate the regression (`scored_self`,
-`scored_opp`, about +/-10 pp) are nearly *constant across the candidate moves
-within a position* — a given move rarely scores — so they carry most of the
-variance between positions while contributing nothing to ordering within one.
-Advancement is the mirror image: a weak absolute predictor but a strong
-discriminator between siblings.
+**Retraction.** An earlier version of this note claimed the opposite — that the
+fitted model was a *worse* move chooser than plain advancement, and drew a
+conclusion about value-fitting being the wrong objective. That was an
+implementation bug, not a finding:
 
-The correct objective for move choice is the *difference* in value between
-sibling moves. See `docs/analysis-roadmap.md`.
+- A score is the *mover's* win percentage, and converting it to a fixed
+  perspective is a reflection about 50 (`v -> 100 - v`), not a negation. The code
+  negated it.
+- The fit dropped the intercept, on the reasoning that a constant shifts all
+  candidate moves equally. That is false here: a move onto a rosette keeps the
+  turn while other moves pass it, so the reflection applies to some successors
+  and not others, and the constant does not cancel. The fitted model had the
+  largest intercept, so it was hurt most.
+
+Both are fixed, and the feature set is now fully paired self/opponent so that
+weight vectors can be antisymmetric, which is what the reflection requires.
+
+The *theoretical* point still stands and is worth a sentence: squared value error
+is not the loss that determines move choice, since what matters is the ordering
+of sibling moves. It simply does not bite here — least squares already produces
+the best evaluator tested. Whether a within-position centred fit (which
+annihilates everything constant across siblings) improves on it is open.
 
 ## 6. Ranking of heuristics differs by rule set
 
-Blitz gains most from the composite heuristic (0.278 against advancement's 0.612,
-a factor of 2.2), while on Finkel advancement alone is already the best of the
-hand-built set. This is consistent with the rules: blitz grants an extra roll for
-a capture, so threat and centre control compound in a way they do not in Finkel.
+Blitz benefits far more from centre control and capture threat than Finkel does,
+consistent with the rules: blitz grants an extra roll for a capture, so
+aggression compounds in a way it does not in Finkel.
+
+Numbers to be regenerated for all three rule sets with the corrected code.
 
 Supports the point that heuristic weights must be fitted per rule set.
 

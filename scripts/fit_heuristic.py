@@ -41,9 +41,13 @@ def main() -> None:
     features = np.array([[float(row[name]) for name in names] for row in rows])
     values = np.array([float(row["value_mover"]) for row in rows])
 
-    # An intercept shifts every candidate move equally, so it cannot change which
-    # move is chosen. It is fitted for an honest R^2, then dropped from the
-    # weights file.
+    # The intercept is fitted AND kept. It is tempting to drop it on the grounds
+    # that a constant shifts every candidate move equally and so cannot change
+    # which move is chosen -- but that is false here. A score is the *mover's*
+    # win percentage, and converting to a fixed perspective reflects it about 50
+    # (`v -> 100 - v`). A move onto a rosette keeps the turn while other moves
+    # pass it, so the reflection applies to some successors and not others, and
+    # the intercept does not cancel.
     design = np.hstack([features, np.ones((len(features), 1))])
     solution, *_ = np.linalg.lstsq(design, values, rcond=None)
     predicted = design @ solution
@@ -57,12 +61,12 @@ def main() -> None:
     for name, weight in sorted(zip(names, solution), key=lambda pair: -abs(pair[1])):
         squares = f"{weight / scale:+8.1f}" if scale > 0 else "      --"
         print(f"  {name:>18s} {weight:+9.3f}   {squares} squares of advancement")
-    print(f"  {'intercept':>18s} {solution[-1]:+9.3f}   (dropped: cannot affect move choice)")
+    print(f"  {'intercept':>18s} {solution[-1]:+9.3f}   (kept: see comment in source)")
 
     destination.write_text(
         "# fitted by scripts/fit_heuristic.py, one weight per line\n"
-        f"# order: {','.join(names)}\n"
-        + "\n".join(f"{weight:.10f}" for weight in solution[:-1])
+        f"# order: {','.join(names)},intercept\n"
+        + "\n".join(f"{weight:.10f}" for weight in solution)
         + "\n"
     )
     print(f"\nwrote {destination}")

@@ -2337,12 +2337,22 @@ fn validate_encoding(lut: &TrainingLut, samples: usize) {
 // same shape as Lut::light_win_percent -- so one argmax routine serves them all.
 // ---------------------------------------------------------------------------
 
-const FEATURE_COUNT: usize = 12;
+const FEATURE_COUNT: usize = 14;
+/// Every feature is paired self/opponent, so a weight vector can be made
+/// antisymmetric. That matters: a position's value from the mover's view and
+/// from the opponent's view are related by `v -> 100 - v`, so only an
+/// antisymmetric score (about the 50 intercept) is consistent under that
+/// reflection. An unpaired feature would silently bias every comparison between
+/// a move that keeps the turn and one that passes it.
 const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
     "advancement_self", "advancement_opp", "scored_self", "scored_opp",
     "hand_self", "hand_opp", "safe_self", "safe_opp",
-    "exposure_self", "threat_self", "centre_self", "frontmost_self",
+    "exposure_self", "threat_self", "centre_self", "centre_opp",
+    "frontmost_self", "frontmost_opp",
 ];
+/// Weight vectors carry a trailing intercept, so a score is on the 0-100
+/// win-percentage scale and can be reflected the same way the table's values are.
+const WEIGHT_COUNT: usize = FEATURE_COUNT + 1;
 
 /// Features of a position, always from the perspective of the player to move.
 ///
@@ -2359,6 +2369,7 @@ fn features(lut: &Lut, game: &Game) -> [f64; FEATURE_COUNT] {
     let mut advancement_self = 0.0;
     let mut advancement_opp = 0.0;
     let mut frontmost_self: f64 = 0.0;
+    let mut frontmost_opp: f64 = 0.0;
     for tile in 0..BOARD_LEN {
         let piece = game.board[tile];
         if piece == 0 {
@@ -2370,6 +2381,7 @@ fn features(lut: &Lut, game: &Game) -> [f64; FEATURE_COUNT] {
             frontmost_self = frontmost_self.max(progress);
         } else {
             advancement_opp += progress;
+            frontmost_opp = frontmost_opp.max(progress);
         }
     }
 
@@ -2413,7 +2425,9 @@ fn features(lut: &Lut, game: &Game) -> [f64; FEATURE_COUNT] {
         capture_probability(lut, game, false),
         capture_probability(lut, game, true),
         if game.board[CENTRE_ROSETTE] * sign > 0 { 1.0 } else { 0.0 },
+        if game.board[CENTRE_ROSETTE] * sign < 0 { 1.0 } else { 0.0 },
         frontmost_self,
+        frontmost_opp,
     ]
 }
 
@@ -2494,57 +2508,58 @@ impl Heuristic {
     /// Weights over FEATURE_NAMES. Hand-set to make each rung of the ladder
     /// isolate one idea; the fitted model replaces these with regression on the
     /// exact values.
-    fn weights(self, path_len: f64) -> [f64; FEATURE_COUNT] {
-        let mut w = [0.0; FEATURE_COUNT];
+    /// Weights over FEATURE_NAMES plus a trailing intercept. Each is written
+    /// antisymmetrically (every self term mirrored by its opponent term) so the
+    /// score behaves correctly under the `v -> 100 - v` reflection.
+    fn weights(self, path_len: f64) -> [f64; WEIGHT_COUNT] {
+        let mut w = [0.0; WEIGHT_COUNT];
+        w[FEATURE_COUNT] = 50.0; // intercept: an even position scores 50
+        fn set(w: &mut [f64; WEIGHT_COUNT], index: usize, value: f64) {
+            w[index] = value;
+            w[index + 1] = -value;
+        }
         match self {
             Self::Random => {}
-            Self::Advancement => {
-                w[0] = 1.0;
-            }
+            Self::Advancement => set(&mut w, 0, 1.0),
             Self::Lead => {
-                w[0] = 1.0;
-                w[1] = -1.0;
+                set(&mut w, 0, 1.0);
+                set(&mut w, 4, -1.0); // pieces still in hand are behind
             }
             Self::ScoreRace => {
-                w[0] = 1.0;
-                w[1] = -1.0;
-                // A scored piece is safe forever, so it is worth more than the
+                set(&mut w, 0, 1.0);
+                // A scored piece is safe forever, so it outweighs the
                 // advancement it represents.
-                w[2] = 2.0 * path_len;
-                w[3] = -2.0 * path_len;
+                set(&mut w, 2, 2.0 * path_len);
             }
             Self::Safety => {
-                w[0] = 1.0;
-                w[1] = -1.0;
-                w[2] = 2.0 * path_len;
-                w[3] = -2.0 * path_len;
-                w[6] = 2.0;
-                w[7] = -2.0;
+                set(&mut w, 0, 1.0);
+                set(&mut w, 2, 2.0 * path_len);
+                set(&mut w, 6, 2.0);
             }
             Self::Centre => {
-                w[0] = 1.0;
-                w[1] = -1.0;
-                w[2] = 2.0 * path_len;
-                w[3] = -2.0 * path_len;
-                w[6] = 2.0;
-                w[7] = -2.0;
-                w[10] = 4.0;
+                set(&mut w, 0, 1.0);
+                set(&mut w, 2, 2.0 * path_len);
+                set(&mut w, 6, 2.0);
+                set(&mut w, 10, 4.0);
             }
-            Self::Exposure | Self::Composite => {
-                w[0] = 1.0;
-                w[1] = -1.0;
-                w[2] = 2.0 * path_len;
-                w[3] = -2.0 * path_len;
-                w[6] = 2.0;
-                w[7] = -2.0;
-                w[10] = 4.0;
-                // Exposure and threat are probabilities; scale them to be
-                // comparable with a few squares of advancement.
+            Self::Exposure => {
+                set(&mut w, 0, 1.0);
+                set(&mut w, 2, 2.0 * path_len);
+                set(&mut w, 6, 2.0);
+                set(&mut w, 10, 4.0);
+                // exposure_self is the opponent's threat, so the pair (8, 9) is
+                // already antisymmetric with a single sign.
                 w[8] = -6.0;
-                if self == Self::Composite {
-                    w[9] = 3.0;
-                    w[11] = 0.5;
-                }
+                w[9] = 6.0;
+            }
+            Self::Composite => {
+                set(&mut w, 0, 1.0);
+                set(&mut w, 2, 2.0 * path_len);
+                set(&mut w, 6, 2.0);
+                set(&mut w, 10, 4.0);
+                w[8] = -6.0;
+                w[9] = 6.0;
+                set(&mut w, 12, 0.5);
             }
         }
         w
@@ -2554,7 +2569,7 @@ impl Heuristic {
 /// A light-favouring score for a position, mirroring Lut::light_win_percent so
 /// heuristics can be swapped in wherever the table is used.
 fn heuristic_light_value(
-    weights: Option<&[f64; FEATURE_COUNT]>,
+    weights: Option<&[f64; WEIGHT_COUNT]>,
     lut: &Lut,
     game: &Game,
     rng: &mut SplitMix64,
@@ -2567,14 +2582,23 @@ fn heuristic_light_value(
         return (rng.next_u64() >> 11) as f64;
     };
     let features = features(lut, game);
-    let score: f64 = features.iter().zip(weights.iter()).map(|(f, w)| f * w).sum();
-    // features() is written from the mover's perspective; flip to light's.
-    if game.is_light_turn { score } else { -score }
+    // features() is from the mover's perspective, so this estimates the mover's
+    // win percentage; convert to light's exactly as Lut::light_win_percent does.
+    // A negation would be wrong: the two perspectives are related by a
+    // reflection about 50, and the difference is not constant across successors
+    // because a move onto a rosette keeps the turn while others pass it.
+    let mover: f64 = features
+        .iter()
+        .zip(weights.iter())
+        .map(|(f, w)| f * w)
+        .sum::<f64>()
+        + weights[FEATURE_COUNT];
+    if game.is_light_turn { mover } else { 100.0 - mover }
 }
 
 /// Pick a move with an arbitrary evaluator, mirroring choose_optimal_move.
 fn choose_move_with(
-    weights: Option<&[f64; FEATURE_COUNT]>,
+    weights: Option<&[f64; WEIGHT_COUNT]>,
     lut: &Lut,
     game: &Game,
     moves: &[i8],
@@ -2797,7 +2821,7 @@ fn regret_report(
 
     // (name, weights); None means uniformly random move choice.
     let path_len = lut.rules.light_path().len() as f64;
-    let mut ladder: Vec<(String, Option<[f64; FEATURE_COUNT]>)> = Heuristic::all()
+    let mut ladder: Vec<(String, Option<[f64; WEIGHT_COUNT]>)> = Heuristic::all()
         .iter()
         .map(|h| {
             let weights = if *h == Heuristic::Random { None } else { Some(h.weights(path_len)) };
@@ -2816,12 +2840,12 @@ fn regret_report(
             .collect();
         assert_eq!(
             values.len(),
-            FEATURE_COUNT,
-            "expected {FEATURE_COUNT} weights in {}, found {}",
+            WEIGHT_COUNT,
+            "expected {WEIGHT_COUNT} weights (features then intercept) in {}, found {}",
             path.display(),
             values.len()
         );
-        let mut weights = [0.0; FEATURE_COUNT];
+        let mut weights = [0.0; WEIGHT_COUNT];
         weights.copy_from_slice(&values);
         ladder.push(("fitted".to_string(), Some(weights)));
     }
