@@ -124,20 +124,25 @@ def main() -> None:
     try:
         import xgboost as xgb
 
-        sign = 1 - 2 * passed
-        split = int(0.7 * len(offsets))
-        train_rows = np.arange(len(values)) < offsets[split]
+        # Split by POSITION, not by row: candidate moves of one position must
+        # not straddle the split, or the model sees the answer at test time.
+        split_position = int(0.7 * len(offsets))
+        boundary = offsets[split_position]
+        train = np.arange(len(values)) < boundary
         model = xgb.XGBRegressor(
             n_estimators=400, max_depth=6, learning_rate=0.08,
             subsample=0.8, colsample_bytree=0.8, verbosity=0,
         )
-        model.fit(features[train_rows], target[train_rows])
+        model.fit(features[train], target[train])
         predicted = model.predict(features)
-        # Held-out positions only, so this is comparable to nothing else here;
-        # report both for honesty.
-        held = Positions(values[~train_rows], passed[~train_rows],
-                         np.flatnonzero(np.r_[True, np.diff(np.searchsorted(offsets, np.flatnonzero(~train_rows))) != 0]))
-        print(f"  {'xgboost (all rows, in-sample)':<42s} regret = {positions.regret(predicted):.4f} pp")
+
+        held_offsets = offsets[split_position:] - boundary
+        held = Positions(values[~train], passed[~train], held_offsets)
+        print(f"  {'xgboost, held-out positions':<42s} regret = {held.regret(predicted[~train]):.4f} pp")
+        # Same held-out positions for the best linear model, so the comparison
+        # is like for like.
+        linear_held = held.regret((design_all @ weights_all)[~train])
+        print(f"  {'best linear (additive), same rows':<42s} regret = {linear_held:.4f} pp")
     except Exception as exc:  # pragma: no cover
         print(f"  xgboost unavailable or failed: {exc}")
 
