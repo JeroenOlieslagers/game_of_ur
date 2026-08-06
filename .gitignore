@@ -1,2 +1,31 @@
 *.DS_Store
+
+# Solved maps and their working files. These run from hundreds of MB to several
+# GB and are either downloaded or regenerated: see scripts/download_models.py.
+models/
+*.rgu
+*.rgu.partial
+*.checkpoint
+*.checkpoint.*
+*.layers/
+
+# Simulation and analysis outputs, also regenerated.
+results/
+random_results/
+bench/
+logs/
+*.jld2
+*.csv
+
+# Rust build artefacts, and the toolchains the cluster scripts install in-tree.
+rust/target/
+.cargo/
+.rustup/
+.toolchain/
+.build.lock
+
+# Resolved per machine for this package.
+Manifest.toml
+
+# Vendored BayesElo build (see analysis/bayeselo_readme.txt).
 BayesElo
