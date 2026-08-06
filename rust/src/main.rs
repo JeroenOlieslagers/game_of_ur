@@ -2624,6 +2624,192 @@ fn choose_move_with(
     best_move
 }
 
+/// Dump every candidate move of every sampled position: the successor's
+/// features, whether the move passed the turn, and the successor's exact value
+/// from the *original* mover's perspective.
+///
+/// This makes the whole move-choice problem solvable offline. For any weight
+/// vector the score of a successor is `f . w + b`, reflected to `100 - (f . w + b)`
+/// when the move passed the turn, so regret can be evaluated for arbitrary
+/// weights without re-running the engine. That is what makes a Shapley
+/// decomposition over regret affordable: 2^14 subsets would be hopeless if each
+/// needed a fresh pass through move generation.
+fn dump_moves(model: &Path, output: &Path, samples: usize, on_policy: bool, seed: u64) {
+    let lut = Lut::read(model);
+    let mut rng = SplitMix64::new(seed);
+    let mut file = BufWriter::new(File::create(output).unwrap());
+    writeln!(file, "state,move,turn_passed,value_mover,{}", FEATURE_NAMES.join(",")).unwrap();
+
+    let mut moves = [0i8; 8];
+    let mut written = 0usize;
+    let mut state_id = 0usize;
+    let mut game = Game::initial(lut.rules);
+
+    while written < samples {
+        // Either walk an optimal game or jump to a random stored position.
+        let decision = if on_policy {
+            if game.finished {
+                game = Game::initial(lut.rules);
+            }
+            let roll = lut.rules.roll(&mut rng);
+            let count = game.apply_roll(roll, &mut moves);
+            if count == 0 {
+                continue;
+            }
+            let chosen = choose_optimal_move(&lut, &game, &moves[..count]);
+            let snapshot = game.clone();
+            game.apply_move(chosen, lut.rules);
+            if count < 2 {
+                continue;
+            }
+            snapshot
+        } else {
+            let (key, _) = lut.key_value_at_global(rng.index(lut.total));
+            let mut candidate = lut.encoding.decode(key);
+            if candidate.finished {
+                continue;
+            }
+            let roll = lut.rules.roll(&mut rng);
+            let count = candidate.apply_roll(roll, &mut moves);
+            if count < 2 {
+                continue;
+            }
+            candidate
+        };
+
+        let count = decision.available_moves(&mut moves);
+        let mover_is_light = decision.is_light_turn;
+        for (move_index, &source) in moves[..count].iter().enumerate() {
+            let mut next = decision.clone();
+            next.apply_move(source, lut.rules);
+            let turn_passed = next.is_light_turn != mover_is_light;
+            let light = lut.light_win_percent(&next);
+            let value_mover = if mover_is_light { light } else { 100.0 - light };
+            let row = if next.finished {
+                // A finished position has no features; its value is decisive, so
+                // mark it and let the consumer handle it.
+                vec!["0".to_string(); FEATURE_COUNT]
+            } else {
+                features(&lut, &next).iter().map(|v| format!("{v:.4}")).collect()
+            };
+            writeln!(
+                file,
+                "{state_id},{move_index},{},{value_mover:.9},{}",
+                u8::from(turn_passed),
+                row.join(",")
+            )
+            .unwrap();
+        }
+        written += 1;
+        state_id += 1;
+    }
+    file.flush().unwrap();
+    eprintln!("wrote {written} positions to {}", output.display());
+}
+
+/// Accumulate the normal equations for a least-squares fit over **every**
+/// non-terminal state in the map, rather than a sample.
+///
+/// Least squares only needs `X'X` and `X'y`, which are sums over rows, so the
+/// exact full-population fit costs one streaming pass and a fixed-size
+/// accumulator -- no need to hold 500 million feature rows anywhere. Since the
+/// map is the entire population of states, there is no sampling error and
+/// nothing to overfit to.
+///
+/// A further consequence: every subset of features can afterwards be fitted by
+/// solving the corresponding submatrix of this one Gram matrix, so all 2^k
+/// subset fits come free from a single pass.
+fn feature_gram(model: &Path, output: &Path) {
+    let lut = Lut::read(model);
+    let columns = FEATURE_COUNT + 1; // features plus the intercept column
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let chunk = (lut.total + threads - 1) / threads;
+    let started = Instant::now();
+
+    let partials: Vec<(Vec<f64>, Vec<f64>, f64, usize)> = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for thread_index in 0..threads {
+            let begin = thread_index * chunk;
+            let end = (begin + chunk).min(lut.total);
+            let lut = &lut;
+            handles.push(scope.spawn(move || {
+                let mut xtx = vec![0.0f64; columns * columns];
+                let mut xty = vec![0.0f64; columns];
+                let mut yty = 0.0f64;
+                let mut rows = 0usize;
+                let mut buffer = vec![0.0f64; columns];
+                for global in begin..end {
+                    let (key, _) = lut.key_value_at_global(global);
+                    let game = lut.encoding.decode(key);
+                    if game.finished {
+                        continue;
+                    }
+                    let f = features(lut, &game);
+                    buffer[..FEATURE_COUNT].copy_from_slice(&f);
+                    buffer[FEATURE_COUNT] = 1.0;
+                    // The stored value is the mover's win percentage, which is
+                    // the perspective features() uses.
+                    let light = lut.light_win_percent(&game);
+                    let y = if game.is_light_turn { light } else { 100.0 - light };
+                    for i in 0..columns {
+                        let bi = buffer[i];
+                        if bi == 0.0 {
+                            continue;
+                        }
+                        xty[i] += bi * y;
+                        for j in i..columns {
+                            xtx[i * columns + j] += bi * buffer[j];
+                        }
+                    }
+                    yty += y * y;
+                    rows += 1;
+                }
+                (xtx, xty, yty, rows)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut xtx = vec![0.0f64; columns * columns];
+    let mut xty = vec![0.0f64; columns];
+    let mut yty = 0.0f64;
+    let mut rows = 0usize;
+    for (a, b, c, n) in partials {
+        for i in 0..columns * columns {
+            xtx[i] += a[i];
+        }
+        for i in 0..columns {
+            xty[i] += b[i];
+        }
+        yty += c;
+        rows += n;
+    }
+    // Only the upper triangle was accumulated.
+    for i in 0..columns {
+        for j in 0..i {
+            xtx[i * columns + j] = xtx[j * columns + i];
+        }
+    }
+
+    let mut file = BufWriter::new(File::create(output).unwrap());
+    writeln!(file, "# exact normal equations over all non-terminal states").unwrap();
+    writeln!(file, "# columns: {},intercept", FEATURE_NAMES.join(",")).unwrap();
+    writeln!(file, "rows,{rows}").unwrap();
+    writeln!(file, "yty,{yty:.10e}").unwrap();
+    for i in 0..columns {
+        let row: Vec<String> = (0..columns).map(|j| format!("{:.10e}", xtx[i * columns + j])).collect();
+        writeln!(file, "xtx,{}", row.join(",")).unwrap();
+    }
+    let row: Vec<String> = xty.iter().map(|v| format!("{v:.10e}")).collect();
+    writeln!(file, "xty,{}", row.join(",")).unwrap();
+    file.flush().unwrap();
+    eprintln!(
+        "accumulated {rows} states in {:.1}s -> {}",
+        started.elapsed().as_secs_f64(),
+        output.display()
+    );
+}
+
 /// Index of a state's score layer in the order the solver completes them.
 fn layer_index_of(lut: &Lut, game: &Game, pair_to_index: &[usize]) -> usize {
     let low = game.light_score.min(game.dark_score) as usize;
@@ -2923,6 +3109,24 @@ fn main() {
     if command == "preflight-train" {
         let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
         preflight_training(&model, samples);
+        return;
+    }
+    if command == "feature-gram" {
+        if args.len() < 4 {
+            usage();
+        }
+        feature_gram(&model, Path::new(&args[3]));
+        return;
+    }
+    if command == "dump-moves" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let samples = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50_000);
+        let on_policy = !matches!(args.get(5).map(String::as_str), Some("uniform"));
+        let seed = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0x3ad9_51c7_60fe_2b44);
+        dump_moves(&model, &output, samples, on_policy, seed);
         return;
     }
     if command == "stage-curve" {
