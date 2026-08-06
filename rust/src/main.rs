@@ -1053,6 +1053,90 @@ fn write_epsilon(lut: &Lut, path: &Path, games_per_epsilon: usize, seed: u64) {
     }
 }
 
+/// Seed used to pick the states compared against simulation. Fixed, so that
+/// every shard simulates the same set of states and their counts can be summed.
+const COMPARE_STATE_SEED: u64 = 0x1234_5678_9abc_def0;
+
+/// One shard of the Monte Carlo simulations, for running as a Slurm array and
+/// combining afterwards.
+///
+/// Both outputs are binomial counts, so shards combine exactly: summing `games`
+/// and the win counts per state (or per epsilon) is identical to having run one
+/// long simulation. Only the game RNG depends on `shard_seed`; the states
+/// themselves come from COMPARE_STATE_SEED so all shards agree on them.
+///
+/// Percentages are deliberately not written here -- they are recomputed from the
+/// summed counts by scripts/aggregate_simulations.py, because averaging
+/// per-shard percentages would be wrong when shards differ in size.
+fn write_simulation_shard(
+    lut: &Lut,
+    output_dir: &Path,
+    label: &str,
+    compare_states: usize,
+    games_per_state: usize,
+    games_per_epsilon: usize,
+    shard_seed: u64,
+) {
+    fs::create_dir_all(output_dir).unwrap();
+    let name = lut.rules.name();
+    let started = Instant::now();
+
+    if compare_states > 0 && games_per_state > 0 {
+        let path = output_dir.join(format!("{name}_compare_{label}.csv"));
+        let mut output = BufWriter::new(File::create(&path).unwrap());
+        writeln!(output, "state,key,predicted_pct,games,light_wins").unwrap();
+        let mut sampling_rng = SplitMix64::new(COMPARE_STATE_SEED);
+        for state_index in 0..compare_states {
+            let (key, predicted) = loop {
+                let candidate = lut.key_value_at_global(sampling_rng.index(lut.total));
+                if !lut.encoding.decode(candidate.0).finished {
+                    break candidate;
+                }
+            };
+            let start_game = lut.encoding.decode(key);
+            let game_seed = shard_seed
+                ^ key
+                ^ (state_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let wins = parallel_games(lut, &start_game, games_per_state, game_seed, 0, false);
+            writeln!(output, "{state_index},{key:#x},{predicted:.12},{games_per_state},{wins}").unwrap();
+        }
+        output.flush().unwrap();
+        eprintln!(
+            "shard {label}: compare states={compare_states} games_per_state={games_per_state} \
+             games={} elapsed={:.1}s",
+            compare_states * games_per_state,
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    if games_per_epsilon > 0 {
+        let path = output_dir.join(format!("{name}_epsilon_{label}.csv"));
+        let mut output = BufWriter::new(File::create(&path).unwrap());
+        writeln!(output, "epsilon,games,optimal_wins").unwrap();
+        for epsilon in 0u8..=100 {
+            let epsilon_seed = shard_seed
+                ^ 0xfedc_ba98_7654_3210
+                ^ (epsilon as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let wins = parallel_games(
+                lut,
+                &Game::initial(lut.rules),
+                games_per_epsilon,
+                epsilon_seed,
+                epsilon,
+                true,
+            );
+            writeln!(output, "{:.2},{games_per_epsilon},{wins}", epsilon as f64 / 100.0).unwrap();
+        }
+        output.flush().unwrap();
+        eprintln!(
+            "shard {label}: epsilon levels=101 games_per_epsilon={games_per_epsilon} \
+             games={} elapsed={:.1}s",
+            101 * games_per_epsilon,
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TrainingMap {
     count: usize,
@@ -1566,16 +1650,46 @@ fn solve_layer_gauss_seidel(
     residual
 }
 
+/// Where the iteration starts from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Init {
+    /// The published Percent16 values, which are the solution already, quantised.
+    /// Refining them to f64 is the cheap case: the starting residual is ~1e-3.
+    Published,
+    /// A flat 50% for every state, ignoring the published values and keeping only
+    /// the map's state keys. This is a solve from scratch in the sense that no
+    /// prior solution is used, and it is the honest number to quote for "how long
+    /// does it take to solve the game", as opposed to "to refine a known
+    /// solution". Terminal states are never read through the value array (their
+    /// value comes from the game result), so overwriting every entry is safe.
+    Naive,
+}
+
+impl Init {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Naive => "naive",
+        }
+    }
+}
+
 fn train_f64(
     input: &Path,
     output: &Path,
     tolerance: f64,
     max_iterations: usize,
     strategy: Strategy,
+    init: Init,
 ) {
     assert!(tolerance > 0.0);
-    eprintln!("strategy={}", strategy.name());
+    eprintln!("strategy={} init={}", strategy.name(), init.name());
     let mut lut = TrainingLut::read_percent16(input);
+    if init == Init::Naive {
+        // Discard the published values; keep only the state keys.
+        lut.values.iter_mut().for_each(|value| *value = 50.0);
+        eprintln!("init: discarded published values, all states set to 50%");
+    }
     let layer_dir = output.with_extension("layers");
     let pairs = build_layer_files(&lut, &layer_dir);
     let checkpoint = output.with_extension("checkpoint");
@@ -2215,7 +2329,7 @@ fn validate_encoding(lut: &TrainingLut, samples: usize) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>");
+    eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis simulate <model.rgu> <output-dir> <label> [compare-states] [games-per-state] [games-per-epsilon] [shard-seed]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>");
     std::process::exit(2);
 }
 
@@ -2229,6 +2343,36 @@ fn main() {
     if command == "preflight-train" {
         let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
         preflight_training(&model, samples);
+        return;
+    }
+    if command == "simulate" {
+        if args.len() < 5 {
+            usage();
+        }
+        let lut = Lut::read(&model);
+        let output_dir = PathBuf::from(&args[3]);
+        let label = args[4].clone();
+        let compare_states = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(100);
+        let games_per_state = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+        let games_per_epsilon = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+        // The label doubles as the shard seed when it parses as a number, so a
+        // Slurm array task id is enough to make a shard distinct.
+        let shard_seed = args
+            .get(8)
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| label.parse::<u64>().ok())
+            .unwrap_or(0)
+            .wrapping_mul(0xa076_1d64_78bd_642f)
+            .wrapping_add(0x9e37_79b9_7f4a_7c15);
+        write_simulation_shard(
+            &lut,
+            &output_dir,
+            &label,
+            compare_states,
+            games_per_state,
+            games_per_epsilon,
+            shard_seed,
+        );
         return;
     }
     if command == "compare-checkpoint" {
@@ -2269,7 +2413,15 @@ fn main() {
                 usage();
             }
         };
-        train_f64(&model, &output, tolerance, max_iterations, strategy);
+        let init = match args.get(7).map(String::as_str) {
+            None | Some("published") => Init::Published,
+            Some("naive") => Init::Naive,
+            Some(other) => {
+                eprintln!("unknown init: {other}");
+                usage();
+            }
+        };
+        train_f64(&model, &output, tolerance, max_iterations, strategy, init);
         return;
     }
     let lut = Lut::read(&model);
