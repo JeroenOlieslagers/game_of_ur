@@ -42,3 +42,7 @@ paper/
 *.synctex.gz
 *.toc
 *.out
+
+# Stray analysis outputs; these belong outside the repo.
+ruleset_analysis/
+*_weights.txt
