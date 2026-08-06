@@ -151,9 +151,26 @@ function fig3(file, inset_y_limits)
     return f
 end
 
-for ruleset in ("blitz", "masters")
-    model_name = ruleset == "blitz" ? "blitz_f64.rgu" : "masters3d_f64.rgu"
-    inset_y_limits = ruleset == "blitz" ? (98, 100) : (99.8, 100)
+# The map is read only for its training-precision metadata, which annotates the
+# gap histogram; the figure data itself comes from the CSVs.
+const MODEL_FILES = Dict(
+    "blitz"   => "blitz_f64.rgu",
+    "masters" => "masters3d_f64.rgu",
+    "finkel"  => "finkel_f64_ours.rgu",
+)
+# The inset magnifies the high-epsilon corner, where the optimal agent's win
+# rate approaches 100%; each rule set needs its own window.
+const INSET_LIMITS = Dict(
+    "blitz"   => (98, 100),
+    "masters" => (99.8, 100),
+    "finkel"  => (99.5, 100),
+)
+
+const RULESETS = length(ARGS) >= 4 ? split(ARGS[4], ",") : ["blitz", "finkel", "masters"]
+
+for ruleset in RULESETS
+    model_name = MODEL_FILES[ruleset]
+    inset_y_limits = INSET_LIMITS[ruleset]
     precision = training_precision(joinpath(MODEL_DIR, model_name))
     gap_figure, ties = fig1(joinpath(RESULTS_DIR, "$(ruleset)_gaps.csv"), precision)
     save(joinpath(FIGURE_DIR, "$(ruleset)_difference_hist.pdf"), gap_figure)
