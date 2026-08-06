@@ -193,7 +193,22 @@ Hardware: one node of the NYU Torch cluster — 2 sockets x 64 cores, 513 GB RAM
 x86_64, glibc 2.34. Each job used **16 of the 128 cores** and a fraction of the
 memory; these are not whole-node runs.
 
-<!-- RESULTS TABLE -->
+| Rule set | States | Score layers | Solve time | Final residual |
+| --- | --- | --- | --- | --- |
+| Blitz | 41,254,034 | 15 | **25.6 s** | 2.842170943040e-14 |
+| Finkel | 137,892,016 | 28 | pending | 2.842170943040e-14 |
+| Masters | 500,981,472 | 28 | pending | pending |
+
+For scale on the Blitz run: its largest score layer holds 14,993,636 states and
+converged in 65 sweeps at 0.07 s per sweep, with the successor table for that
+layer built in 2.24 s. End to end the job took 49 s of wall clock, including
+compiling the solver and verifying the output.
+
+The comparison worth making is against the same solver using
+`ondemand-jacobi`: on 8 cores of a laptop that scheme took over two hours to get
+64% of the way through Blitz, versus 25.6 s here for all of it. Some of that gap
+is hardware, but most is not — see [Iteration
+strategies](#iteration-strategies).
 
 Runtime is the solve itself, excluding reading the input map and writing the
 output. The solver is single-node by design: score layers are strictly sequential
@@ -208,7 +223,11 @@ Correctness rests on four checks that do not simply restate each other.
 published Percent16 map, and a published `f64` Finkel map by Padraig Lamont
 exists separately. Ours is diffed against it.
 
-<!-- FINKEL VALIDATION -->
+Before any solve was run, the Finkel rules were validated by the residual check
+described below: applying our Bellman operator to the published Percent16 values
+returns a residual of `1.335e-3`, exactly the quantisation floor, confirming the
+Bell path, dice distribution and safe-rosette rule are right. The map-level diff
+against Lamont's `finkel_f64.rgu` is pending the cluster run.
 
 **Two iteration schemes against each other.** Blitz was solved twice, once with
 `ondemand-jacobi` and once with `precomputed-gauss-seidel`, on different
