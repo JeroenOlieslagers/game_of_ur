@@ -46,6 +46,7 @@ class Positions:
         self.values, self.offsets = values, offsets
         self.counts = np.diff(np.r_[offsets, len(values)])
         self.best = np.maximum.reduceat(values, offsets)
+        self._owner = None
 
     def regret(self, score):
         group_max = np.repeat(np.maximum.reduceat(score, self.offsets), self.counts)
@@ -58,18 +59,46 @@ class Positions:
         mean = np.add.reduceat(matrix, self.offsets, axis=0) / self.counts[:, None]
         return matrix - np.repeat(mean, self.counts, axis=0)
 
+    def position_mean(self, matrix):
+        """Per-position column means: one row per position, not per move."""
+        return np.add.reduceat(matrix, self.offsets, axis=0) / self.counts[:, None]
+
+    def owner(self):
+        """Which position each row belongs to."""
+        if self._owner is None:
+            self._owner = np.repeat(np.arange(len(self.offsets)), self.counts)
+        return self._owner
+
     def centre1d(self, vector):
         mean = np.add.reduceat(vector, self.offsets) / self.counts
         return vector - np.repeat(mean, self.counts)
 
 
 def fit_and_score(design, target, positions, ridge=1e-6):
-    """Ordering fit. A tiny ridge keeps the one-hot design solvable when some
-    configurations never occur."""
-    a = positions.centre(design)
-    b = positions.centre1d(target)
-    gram = a.T @ a + ridge * np.eye(a.shape[1])
-    weights = np.linalg.solve(gram, a.T @ b)
+    """Ordering fit, solved from the Gram matrix in row blocks.
+
+    A one-hot N-tuple design is wide, so materialising a second centred copy of
+    it costs gigabytes. Accumulating X'X and X'y blockwise keeps memory
+    proportional to columns^2 instead of rows x columns. The ridge keeps the
+    system solvable when some configurations never occur in the data.
+    """
+    columns = design.shape[1]
+    gram = np.zeros((columns, columns))
+    moment = np.zeros(columns)
+    centred_target = positions.centre1d(target)
+    # Per-POSITION means, so the stored array is a third the size of the design,
+    # and blocks are centred by indexing rather than by materialising a second
+    # full-size copy.
+    means = positions.position_mean(design)
+    owner = positions.owner()
+    block = 20000
+    for start in range(0, len(design), block):
+        stop = min(start + block, len(design))
+        chunk = design[start:stop] - means[owner[start:stop]]
+        gram += chunk.T @ chunk
+        moment += chunk.T @ centred_target[start:stop]
+    gram += ridge * np.eye(columns)
+    weights = np.linalg.solve(gram, moment)
     return positions.regret(design @ weights), weights
 
 
@@ -102,7 +131,7 @@ def main() -> None:
     print(f"scalar features, additive           : regret = {base:.4f} pp  ({scalar.shape[1]} weights)")
 
     print("\nN-tuple networks (sliding windows along the path):")
-    for width in (2, 3, 4, 5):
+    for width in (2, 3, 4):
         windows = [tuple(range(start, start + width)) for start in range(path_len - width + 1)]
         design = np.hstack([tuple_design(occupancy, windows, sign), sign[:, None]])
         regret, _ = fit_and_score(design, target, positions)
