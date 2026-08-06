@@ -81,13 +81,25 @@ if [[ -f $OUTPUT ]]; then
 fi
 
 # Queue the successor now so its wait overlaps with this job's runtime.
+#
+# The account and partition have to be passed explicitly: they are not part of
+# the exported environment, and a bare sbatch falls back to the user's default
+# account, which may not be a valid one. Failure here is logged and ignored --
+# the solve is the point, and it can always be resumed by re-running.
 if (( CHAIN < MAX_CHAIN )); then
-    NEXT=$(sbatch --parsable \
+    CHAIN_ARGS=()
+    [[ -n ${SLURM_JOB_ACCOUNT:-} ]] && CHAIN_ARGS+=(--account="$SLURM_JOB_ACCOUNT")
+    [[ -n ${SLURM_JOB_PARTITION:-} ]] && CHAIN_ARGS+=(--partition="$SLURM_JOB_PARTITION")
+    if NEXT=$(sbatch --parsable "${CHAIN_ARGS[@]}" \
         --dependency=afterany:"$SLURM_JOB_ID" \
         --export=ALL,UR_CHAIN=$((CHAIN + 1)),UR_MAX_CHAIN="$MAX_CHAIN",UR_RULESET="$RULESET",UR_STRATEGY="$STRATEGY",UR_TOLERANCE="$TOLERANCE",UR_MAX_ITERATIONS="$MAX_ITERATIONS" \
         --job-name="ur_$RULESET" \
-        "$UR_CLUSTER_DIR/train.sbatch")
-    echo "queued successor chain-link $((CHAIN + 1)) as job $NEXT"
+        "$UR_CLUSTER_DIR/train.sbatch" 2>&1); then
+        echo "queued successor chain-link $((CHAIN + 1)) as job $NEXT"
+    else
+        echo "WARNING: could not queue successor chain-link: $NEXT" >&2
+        echo "continuing anyway; re-run this script to resume from the checkpoint" >&2
+    fi
 else
     echo "chain limit $MAX_CHAIN reached; no successor queued"
 fi
@@ -99,20 +111,20 @@ fi
 # target directory corrupt each other's intermediate objects (one deletes an
 # object the other is about to link). The check is repeated inside the lock so
 # the loser of the race skips the build entirely.
+#
+# cargo is invoked unconditionally rather than only when the binary is missing:
+# its own freshness check makes an up-to-date build a no-op, whereas skipping on
+# "binary exists" silently runs a stale binary after any source change.
 (
     flock 9
-    if [[ ! -x $BINARY ]]; then
-        echo "=== building solver ==="
-        if ! command -v cc >/dev/null 2>&1 && [[ ! -x ${CC:-/nonexistent} ]]; then
-            source "$UR_CONDA_SH"
-            conda create -y -p "$UR_TOOLCHAIN" -c conda-forge \
-                gcc_linux-64 sysroot_linux-64=2.17 binutils_linux-64
-            source "$UR_CLUSTER_DIR/env.sh"
-        fi
-        cargo build --release --manifest-path "$UR_ROOT/rust/Cargo.toml"
-    else
-        echo "binary already present; skipping build"
+    echo "=== building solver (no-op if up to date) ==="
+    if ! command -v cc >/dev/null 2>&1 && [[ ! -x ${CC:-/nonexistent} ]]; then
+        source "$UR_CONDA_SH"
+        conda create -y -p "$UR_TOOLCHAIN" -c conda-forge \
+            gcc_linux-64 sysroot_linux-64=2.17 binutils_linux-64
+        source "$UR_CLUSTER_DIR/env.sh"
     fi
+    cargo build --release --manifest-path "$UR_ROOT/rust/Cargo.toml"
 ) 9>"$UR_ROOT/rust/.build.lock"
 
 if [[ ! -x $BINARY ]]; then

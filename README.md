@@ -189,29 +189,47 @@ refuses to run on a mismatch.
 Solving each rule set from its published Percent16 map down to a residual of
 `3e-14`, using `precomputed-gauss-seidel`.
 
-Hardware: one node of the NYU Torch cluster — 2 sockets x 64 cores, 513 GB RAM,
-x86_64, glibc 2.34. Each job used **16 of the 128 cores** and a fraction of the
-memory; these are not whole-node runs.
+Hardware: one node of the NYU Torch cluster — Intel Xeon Platinum 8592+, 2
+sockets x 64 cores (128 logical CPUs), 503 GiB RAM, glibc 2.34. Each job used
+**16 of the 128 cores** and a fraction of the memory; these are not whole-node
+runs.
 
-| Rule set | States | Score layers | Solve time | Final residual |
-| --- | --- | --- | --- | --- |
-| Blitz | 41,254,034 | 15 | **25.6 s** | 2.842170943040e-14 |
-| Finkel | 137,892,016 | 28 | pending | 2.842170943040e-14 |
-| Masters | 500,981,472 | 28 | pending | pending |
+| Rule set | States | Score layers | Solve time | Output map | First player wins | Final residual |
+| --- | --- | --- | --- | --- | --- | --- |
+| Blitz | 41,254,034 | 15 | **26.8 s** | 0.495 GB | 50.4052555093% | 2.842170943040e-14 |
+| Finkel | 137,892,016 | 28 | **223.2 s** | 1.655 GB | 51.5404732509% | 2.842170943040e-14 |
+| Masters | 500,981,472 | 28 | **880.9 s** | 6.012 GB | 50.4809002027% | 2.842170943040e-14 |
 
-For scale on the Blitz run: its largest score layer holds 14,993,636 states and
-converged in 65 sweeps at 0.07 s per sweep, with the successor table for that
-layer built in 2.24 s. End to end the job took 49 s of wall clock, including
-compiling the solver and verifying the output.
-
-The comparison worth making is against the same solver using
-`ondemand-jacobi`: on 8 cores of a laptop that scheme took over two hours to get
-64% of the way through Blitz, versus 25.6 s here for all of it. Some of that gap
-is hardware, but most is not — see [Iteration
-strategies](#iteration-strategies).
+For scale on the Masters run, the largest rule set: its last score layer holds
+18,746,644 states and converged in 103 sweeps at 0.97 s per sweep. End to end the
+job took 15 min 13 s of wall clock, including building the solver, reading the
+3 GB input map, writing the 6 GB output and verifying it.
 
 Runtime is the solve itself, excluding reading the input map and writing the
-output. The solver is single-node by design: score layers are strictly sequential
+output.
+
+### Core count
+
+More cores help less than expected, because a sweep is a gather over precomputed
+indices and is therefore memory-latency bound rather than compute bound:
+
+| Rule set | 16 cores | 32 cores | Speedup |
+| --- | --- | --- | --- |
+| Blitz | 26.8 s | 31.1 s | 0.86x (slower) |
+| Finkel | 223.2 s | 137.0 s | 1.63x |
+| Masters | 880.9 s | 670.0 s | 1.31x |
+
+Blitz gets *slower* on 32 cores: its score layers are small — the smallest holds
+277 states — and spawning a wider thread pool for every sweep costs more than the
+extra parallelism returns. Sixteen cores is close to the sweet spot for all three
+rule sets, so there is little reason to request a large allocation.
+
+### Against the unoptimised scheme
+
+The comparison worth making is against the same solver using `ondemand-jacobi`.
+On 8 cores of a laptop that scheme took over two hours to reach 64% of the way
+through Blitz, against 26.8 s here for all of it. Some of that gap is hardware,
+but most is not — see [Iteration strategies](#iteration-strategies). The solver is single-node by design: score layers are strictly sequential
 and every sweep needs a global reduction, so it does not distribute across nodes.
 It has not needed to.
 
@@ -223,11 +241,27 @@ Correctness rests on four checks that do not simply restate each other.
 published Percent16 map, and a published `f64` Finkel map by Padraig Lamont
 exists separately. Ours is diffed against it.
 
-Before any solve was run, the Finkel rules were validated by the residual check
-described below: applying our Bellman operator to the published Percent16 values
-returns a residual of `1.335e-3`, exactly the quantisation floor, confirming the
-Bell path, dice distribution and safe-rosette rule are right. The map-level diff
-against Lamont's `finkel_f64.rgu` is pending the cluster run.
+Across all 28 score layers — **137,870,097 states**, every non-terminal state in
+the game — the two maps agree to **7.105e-14** percentage points. That is 5 units
+in the last place at magnitude 100, against a certified residual of 2 ULPs in
+each map: exactly what two independent computations sitting at the `f64` floor
+should produce.
+
+```
+$ royalur_analysis compare-checkpoint \
+    models/finkel_f64_ours.checkpoint models/finkel_f64_ours.layers models/finkel_f64.rgu
+layers_compared=28 states_compared=137870097
+max_abs_diff_overall=7.105427e-14
+```
+
+This is the strongest check available here, because nothing in our pipeline
+shares code with the reference: we implemented the Bell path, the safe-rosette
+capture rule and the key encoding from the rules, and arrived at the same 138
+million values.
+
+Before the solve was even run, the same conclusion followed from the residual
+check described below: applying our Bellman operator to the published Percent16
+values returns `1.335e-3`, exactly the quantisation floor.
 
 **Two iteration schemes against each other.** Blitz was solved twice, once with
 `ondemand-jacobi` and once with `precomputed-gauss-seidel`, on different
@@ -235,6 +269,12 @@ machines. Across the 26,250,145 states of the 14 layers both runs completed they
 agree to `1.847e-13` percentage points — about 13 units in the last place at
 magnitude 100, which is what two different update orders converging to the same
 fixed point at the `f64` floor should look like.
+
+**Repeated runs against each other.** Two independent Gauss-Seidel solves of
+Blitz agree to `5.684e-14` over all 41,243,781 non-terminal states. Because the
+parallel sweep is asynchronous, thread timing varies between runs, so this also
+demonstrates that the non-determinism does not move the converged result beyond
+the residual floor.
 
 **The precomputed table against on-demand generation.** Building a successor
 table proves every successor key resolves in the map, because a missing key
