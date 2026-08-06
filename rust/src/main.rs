@@ -1,0 +1,2298 @@
+use std::cmp::Ordering;
+use std::env;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::thread;
+use std::time::Instant;
+
+const WIDTH: usize = 3;
+const HEIGHT: usize = 8;
+const BOARD_LEN: usize = WIDTH * HEIGHT;
+const ROSETTES: [usize; 5] = [0, 2, 10, 18, 20];
+const LOOKUP_PREFIX_BITS: usize = 20;
+const LOOKUP_PREFIX_COUNT: usize = 1 << LOOKUP_PREFIX_BITS;
+const LOOKUP_LOWER_BITS: usize = 32 - LOOKUP_PREFIX_BITS;
+
+// Exact on-board paths, derived from the waypoints in RoyalUr-Java's
+// MastersPathPair.java and BellPathPair.java with the off-board start and end
+// tiles removed. Board indices are (y - 1) * WIDTH + (x - 1) for the 1-based
+// (x, y) tile coordinates used there.
+const MASTERS_LIGHT_PATH: [usize; 16] = [9, 6, 3, 0, 1, 4, 7, 10, 13, 16, 19, 20, 23, 22, 21, 18];
+const MASTERS_DARK_PATH: [usize; 16] = [11, 8, 5, 2, 1, 4, 7, 10, 13, 16, 19, 18, 21, 22, 23, 20];
+// Bell is the Finkel path: straight up the near column, down the middle, back
+// up the near column, without the Masters detour through the far column.
+const BELL_LIGHT_PATH: [usize; 14] = [9, 6, 3, 0, 1, 4, 7, 10, 13, 16, 19, 22, 21, 18];
+const BELL_DARK_PATH: [usize; 14] = [11, 8, 5, 2, 1, 4, 7, 10, 13, 16, 19, 22, 23, 20];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuleSet {
+    Blitz,
+    Masters,
+    Finkel,
+}
+
+impl RuleSet {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Blitz => "blitz",
+            Self::Masters => "masters",
+            Self::Finkel => "finkel",
+        }
+    }
+
+    fn pieces(self) -> u8 {
+        match self {
+            Self::Blitz => 5,
+            Self::Masters | Self::Finkel => 7,
+        }
+    }
+
+    fn captures_grant_roll(self) -> bool {
+        matches!(self, Self::Blitz)
+    }
+
+    /// Finkel protects pieces standing on a rosette from capture.
+    fn safe_rosettes(self) -> bool {
+        matches!(self, Self::Finkel)
+    }
+
+    fn light_path(self) -> &'static [usize] {
+        match self {
+            Self::Blitz | Self::Masters => &MASTERS_LIGHT_PATH,
+            Self::Finkel => &BELL_LIGHT_PATH,
+        }
+    }
+
+    fn dark_path(self) -> &'static [usize] {
+        match self {
+            Self::Blitz | Self::Masters => &MASTERS_DARK_PATH,
+            Self::Finkel => &BELL_DARK_PATH,
+        }
+    }
+
+    fn roll(self, rng: &mut SplitMix64) -> u8 {
+        match self {
+            // Four binary dice.
+            Self::Blitz | Self::Finkel => (rng.next_u64() as u8 & 0x0f).count_ones() as u8,
+            // Three binary dice, where a roll of zero counts as four.
+            Self::Masters => {
+                let count = (rng.next_u64() as u8 & 0x07).count_ones() as u8;
+                if count == 0 { 4 } else { count }
+            }
+        }
+    }
+
+    fn possible_rolls(self) -> &'static [u8] {
+        match self {
+            Self::Blitz | Self::Finkel => &[0, 1, 2, 3, 4],
+            Self::Masters => &[1, 2, 3, 4],
+        }
+    }
+
+    fn roll_probabilities(self) -> &'static [f64; 5] {
+        match self {
+            Self::Blitz | Self::Finkel => {
+                &[1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0]
+            }
+            Self::Masters => &[0.0, 3.0 / 8.0, 3.0 / 8.0, 1.0 / 8.0, 1.0 / 8.0],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Game {
+    rules: RuleSet,
+    board: [i8; BOARD_LEN],
+    light_pieces: u8,
+    dark_pieces: u8,
+    light_score: u8,
+    dark_score: u8,
+    is_light_turn: bool,
+    roll: i8,
+    finished: bool,
+}
+
+impl Game {
+    fn initial(rules: RuleSet) -> Self {
+        Self {
+            rules,
+            board: [0; BOARD_LEN],
+            light_pieces: rules.pieces(),
+            dark_pieces: rules.pieces(),
+            light_score: 0,
+            dark_score: 0,
+            is_light_turn: true,
+            roll: -1,
+            finished: false,
+        }
+    }
+
+    fn path(&self) -> &'static [usize] {
+        if self.is_light_turn { self.rules.light_path() } else { self.rules.dark_path() }
+    }
+
+    fn turn_sign(&self) -> i8 {
+        if self.is_light_turn { 1 } else { -1 }
+    }
+
+    fn turn_pieces(&self) -> u8 {
+        if self.is_light_turn { self.light_pieces } else { self.dark_pieces }
+    }
+
+    fn available_moves(&self, output: &mut [i8; 8]) -> usize {
+        let roll = self.roll;
+        assert!(roll >= 0);
+        let roll = roll as usize;
+        let path = self.path();
+        let sign = self.turn_sign();
+        let mut count = 0usize;
+
+        if roll <= path.len() {
+            let source = path.len() - roll;
+            if self.board[path[source]] == sign * (source as i8 + 1) {
+                output[count] = source as i8;
+                count += 1;
+            }
+        }
+
+        let max_source_exclusive = path.len().saturating_sub(roll);
+        for encoded_source in 0..=max_source_exclusive {
+            let source: i8 = encoded_source as i8 - 1;
+            if source >= 0 {
+                let source_index = source as usize;
+                if self.board[path[source_index]] != sign * (source + 1) {
+                    continue;
+                }
+            } else if self.turn_pieces() == 0 {
+                continue;
+            }
+
+            let destination_path = (source as isize + roll as isize) as usize;
+            if destination_path >= path.len() {
+                continue;
+            }
+            let destination_tile = path[destination_path];
+            let destination_piece = self.board[destination_tile];
+            if destination_piece != 0 {
+                // Can't land on your own piece.
+                if destination_piece * sign > 0 {
+                    continue;
+                }
+                // Can't capture an opposing piece standing on a rosette when
+                // rosettes are safe (Finkel).
+                if self.rules.safe_rosettes() && ROSETTES.contains(&destination_tile) {
+                    continue;
+                }
+            }
+            output[count] = source;
+            count += 1;
+        }
+        count
+    }
+
+    fn apply_roll(&mut self, roll: u8, moves: &mut [i8; 8]) -> usize {
+        assert!(self.roll < 0);
+        if roll == 0 {
+            self.is_light_turn = !self.is_light_turn;
+            return 0;
+        }
+        self.roll = roll as i8;
+        let count = self.available_moves(moves);
+        if count == 0 {
+            self.is_light_turn = !self.is_light_turn;
+            self.roll = -1;
+        }
+        count
+    }
+
+    fn apply_move(&mut self, source: i8, rules: RuleSet) {
+        let roll = self.roll;
+        assert!(roll > 0);
+        self.roll = -1;
+        let path = self.path();
+        let sign = self.turn_sign();
+
+        if source >= 0 {
+            self.board[path[source as usize]] = 0;
+        } else if self.is_light_turn {
+            self.light_pieces -= 1;
+        } else {
+            self.dark_pieces -= 1;
+        }
+
+        let destination_path = source as isize + roll as isize;
+        if destination_path < path.len() as isize {
+            let destination_path = destination_path as usize;
+            let destination = path[destination_path];
+            let captured = self.board[destination];
+            if captured > 0 {
+                self.light_pieces += 1;
+            } else if captured < 0 {
+                self.dark_pieces += 1;
+            }
+            self.board[destination] = sign * (destination_path as i8 + 1);
+
+            let extra = ROSETTES.contains(&destination)
+                || (rules.captures_grant_roll() && captured != 0);
+            if !extra {
+                self.is_light_turn = !self.is_light_turn;
+            }
+        } else {
+            if self.is_light_turn {
+                self.light_score += 1;
+                if self.light_score >= rules.pieces() {
+                    self.finished = true;
+                    return;
+                }
+            } else {
+                self.dark_score += 1;
+                if self.dark_score >= rules.pieces() {
+                    self.finished = true;
+                    return;
+                }
+            }
+            self.is_light_turn = !self.is_light_turn;
+        }
+    }
+
+    fn reverse_players(&self) -> Self {
+        let mut result = Self {
+            rules: self.rules,
+            board: [0; BOARD_LEN],
+            light_pieces: self.dark_pieces,
+            dark_pieces: self.light_pieces,
+            light_score: self.dark_score,
+            dark_score: self.light_score,
+            is_light_turn: !self.is_light_turn,
+            roll: self.roll,
+            finished: self.finished,
+        };
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                result.board[(WIDTH - 1 - x) + WIDTH * y] = -self.board[x + WIDTH * y];
+            }
+        }
+        result
+    }
+}
+
+/// Identify the rule set from a map's embedded `game_settings` metadata, and
+/// check the rest of the settings match what this solver implements for it.
+fn detect_ruleset(metadata: &str) -> RuleSet {
+    let lower = metadata.to_lowercase();
+    let rules = if lower.contains("\"paths\":\"bell\"") {
+        RuleSet::Finkel
+    } else if lower.contains("three_binary_0eq4") {
+        RuleSet::Masters
+    } else if lower.contains("\"start_pieces\":5") {
+        RuleSet::Blitz
+    } else {
+        panic!("unsupported LUT metadata: {metadata}");
+    };
+
+    // Guard against a map whose settings differ from the rules we would apply.
+    let expect = |field: &str, value: bool| {
+        let needle = format!("\"{field}\":{value}");
+        assert!(
+            lower.contains(&needle),
+            "{} map metadata does not contain {needle}: {metadata}",
+            rules.name()
+        );
+    };
+    expect("safe_rosettes", rules.safe_rosettes());
+    expect("captures_grant_rolls", rules.captures_grant_roll());
+    expect("rosettes_grant_rolls", true);
+    assert!(
+        lower.contains(&format!("\"start_pieces\":{}", rules.pieces())),
+        "{} map metadata does not declare start_pieces {}: {metadata}",
+        rules.name(),
+        rules.pieces()
+    );
+    rules
+}
+
+#[derive(Clone)]
+struct Encoding {
+    rules: RuleSet,
+    war_indices: Vec<usize>,
+    light_safe_indices: Vec<usize>,
+    dark_safe_indices: Vec<usize>,
+    light_path_indices: [i8; BOARD_LEN],
+    dark_path_indices: [i8; BOARD_LEN],
+    compression: Vec<i16>,
+    decompression: Vec<u16>,
+    decompression_counts: Vec<(u8, u8)>,
+    segment_bits: usize,
+    /// War tiles per compression segment.
+    segment_tiles: usize,
+    /// Number of war-tile segments.
+    segment_count: usize,
+    board_bits: usize,
+}
+
+impl Encoding {
+    /// Mirrors `estimateGoodWarTileCompressionTileCount` in RoyalUr-Java's
+    /// SimpleGameStateEncoding: up to 8 war tiles go in one segment, otherwise
+    /// split into the fewest segments of at most 8 tiles each.
+    fn segment_tile_count(war_tile_count: usize) -> usize {
+        if war_tile_count <= 8 {
+            return war_tile_count;
+        }
+        let mut segments = 2;
+        let mut tile_count;
+        loop {
+            tile_count = (war_tile_count + segments - 1) / segments;
+            segments += 1;
+            if tile_count <= 8 {
+                break;
+            }
+        }
+        tile_count
+    }
+
+    fn new(rules: RuleSet) -> Self {
+        let mut light_path_indices = [-1i8; BOARD_LEN];
+        let mut dark_path_indices = [-1i8; BOARD_LEN];
+        for (index, &tile) in rules.light_path().iter().enumerate() {
+            light_path_indices[tile] = index as i8;
+        }
+        for (index, &tile) in rules.dark_path().iter().enumerate() {
+            dark_path_indices[tile] = index as i8;
+        }
+
+        let mut war_indices = Vec::new();
+        let mut light_safe_indices = Vec::new();
+        let mut dark_safe_indices = Vec::new();
+        for tile in 0..BOARD_LEN {
+            let light = light_path_indices[tile] >= 0;
+            let dark = dark_path_indices[tile] >= 0;
+            match (light, dark) {
+                (true, true) => war_indices.push(tile),
+                (true, false) => light_safe_indices.push(tile),
+                (false, true) => dark_safe_indices.push(tile),
+                _ => {}
+            }
+        }
+        // The standard board has 20 tiles; how they split between shared "war"
+        // tiles and each player's private tiles depends on the path pair.
+        assert_eq!(
+            war_indices.len() + light_safe_indices.len() + dark_safe_indices.len(),
+            20
+        );
+        assert_eq!(light_safe_indices.len(), dark_safe_indices.len());
+
+        let segment_tiles = Self::segment_tile_count(war_indices.len());
+        let segment_count = (war_indices.len() + segment_tiles - 1) / segment_tiles;
+        // Partial trailing segments would need the encoder to shift in fewer
+        // tiles for the last segment. Every supported rule set divides evenly.
+        assert_eq!(
+            segment_count * segment_tiles,
+            war_indices.len(),
+            "war tile count {} does not divide into {segment_count} segments of {segment_tiles}",
+            war_indices.len()
+        );
+
+        let (compression, decompression) = Self::build_compression(rules.pieces(), segment_tiles);
+        let decompression_counts = decompression
+            .iter()
+            .map(|&raw| {
+                let mut light = 0u8;
+                let mut dark = 0u8;
+                for local in 0..segment_tiles {
+                    match (raw >> (2 * (segment_tiles - 1 - local))) & 0x3 {
+                        1 => dark += 1,
+                        2 => light += 1,
+                        _ => {}
+                    }
+                }
+                (light, dark)
+            })
+            .collect::<Vec<_>>();
+        let max_compressed = decompression.len() - 1;
+        let mut segment_bits = 1usize;
+        while max_compressed > (1usize << segment_bits) {
+            segment_bits += 1;
+        }
+        let board_bits = 2 * light_safe_indices.len() + segment_count * segment_bits;
+        // Cross-check against the layouts RoyalUr-Java produces, which set the
+        // key widths in the published maps.
+        match rules {
+            RuleSet::Blitz | RuleSet::Masters => {
+                assert_eq!((war_indices.len(), segment_count, segment_bits, board_bits), (12, 2, 10, 28));
+            }
+            RuleSet::Finkel => {
+                assert_eq!((war_indices.len(), segment_count, segment_bits, board_bits), (8, 1, 13, 25));
+            }
+        }
+
+        Self {
+            rules,
+            war_indices,
+            light_safe_indices,
+            dark_safe_indices,
+            light_path_indices,
+            dark_path_indices,
+            compression,
+            decompression,
+            decompression_counts,
+            segment_bits,
+            segment_tiles,
+            segment_count,
+            board_bits,
+        }
+    }
+
+    fn build_compression(pieces: u8, tile_count: usize) -> (Vec<i16>, Vec<u16>) {
+        fn visit(
+            light: i8,
+            dark: i8,
+            state: u16,
+            remaining: usize,
+            values: &mut Vec<u16>,
+        ) {
+            for occupant in 0..3u16 {
+                let mut new_light = light;
+                let mut new_dark = dark;
+                if occupant == 1 {
+                    new_dark -= 1;
+                } else if occupant == 2 {
+                    new_light -= 1;
+                }
+                if new_light < 0 || new_dark < 0 {
+                    continue;
+                }
+                let new_state = (state << 2) | occupant;
+                if remaining == 1 {
+                    values.push(new_state);
+                } else {
+                    visit(new_light, new_dark, new_state, remaining - 1, values);
+                }
+            }
+        }
+
+        let mut decompression = Vec::new();
+        visit(pieces as i8, pieces as i8, 0, tile_count, &mut decompression);
+        let mut compression = vec![-1i16; 1usize << (2 * tile_count)];
+        for (index, &state) in decompression.iter().enumerate() {
+            compression[state as usize] = index as i16;
+        }
+        (compression, decompression)
+    }
+
+    fn encode_light_turn(&self, game: &Game) -> u64 {
+        assert!(game.is_light_turn);
+        let safe_bits = self.light_safe_indices.len();
+        let war_bits = self.segment_count * self.segment_bits;
+
+        let mut dark_safe = 0u64;
+        for (index, &tile) in self.dark_safe_indices.iter().enumerate() {
+            if game.board[tile] != 0 {
+                dark_safe |= 1u64 << index;
+            }
+        }
+        let mut light_safe = 0u64;
+        for (index, &tile) in self.light_safe_indices.iter().enumerate() {
+            if game.board[tile] != 0 {
+                light_safe |= 1u64 << index;
+            }
+        }
+
+        let mut war = 0u64;
+        for segment in 0..self.segment_count {
+            let mut raw = 0usize;
+            for local in 0..self.segment_tiles {
+                let piece = game.board[self.war_indices[segment * self.segment_tiles + local]];
+                let occupant = if piece == 0 { 0 } else if piece < 0 { 1 } else { 2 };
+                raw = (raw << 2) | occupant;
+            }
+            let compressed = self.compression[raw];
+            assert!(compressed >= 0);
+            war = (war << self.segment_bits) | compressed as u64;
+        }
+
+        let board = dark_safe | (war << safe_bits) | (light_safe << (safe_bits + war_bits));
+        board
+            | ((game.dark_pieces as u64) << self.board_bits)
+            | ((game.light_pieces as u64) << (self.board_bits + 3))
+    }
+
+    fn encode_symmetrical(&self, game: &Game) -> u64 {
+        if game.is_light_turn {
+            self.encode_light_turn(game)
+        } else {
+            self.encode_light_turn(&game.reverse_players())
+        }
+    }
+
+    fn decode(&self, key: u64) -> Game {
+        let safe_bits = self.light_safe_indices.len();
+        let war_mask = (1u64 << self.segment_bits) - 1;
+        let board_mask = (1u64 << self.board_bits) - 1;
+        let board_code = key & board_mask;
+        let war_bits = self.segment_count * self.segment_bits;
+        let dark_safe = board_code & ((1u64 << safe_bits) - 1);
+        let war = (board_code >> safe_bits) & ((1u64 << war_bits) - 1);
+        let light_safe = board_code >> (safe_bits + war_bits);
+        let dark_pieces = ((key >> self.board_bits) & 0x7) as u8;
+        let light_pieces = ((key >> (self.board_bits + 3)) & 0x7) as u8;
+
+        let mut game = Game {
+            rules: self.rules,
+            board: [0; BOARD_LEN],
+            light_pieces,
+            dark_pieces,
+            light_score: 0,
+            dark_score: 0,
+            is_light_turn: true,
+            roll: -1,
+            finished: false,
+        };
+
+        for (index, &tile) in self.dark_safe_indices.iter().enumerate() {
+            if ((dark_safe >> index) & 1) != 0 {
+                game.board[tile] = -(self.dark_path_indices[tile] + 1);
+            }
+        }
+        for (index, &tile) in self.light_safe_indices.iter().enumerate() {
+            if ((light_safe >> index) & 1) != 0 {
+                game.board[tile] = self.light_path_indices[tile] + 1;
+            }
+        }
+        for segment in 0..self.segment_count {
+            let shift = (self.segment_count - 1 - segment) * self.segment_bits;
+            let compressed = ((war >> shift) & war_mask) as usize;
+            assert!(compressed < self.decompression.len());
+            let raw = self.decompression[compressed];
+            for local in 0..self.segment_tiles {
+                let occupant_shift = 2 * (self.segment_tiles - 1 - local);
+                let occupant = (raw >> occupant_shift) & 0x3;
+                let tile = self.war_indices[segment * self.segment_tiles + local];
+                game.board[tile] = match occupant {
+                    0 => 0,
+                    1 => -(self.dark_path_indices[tile] + 1),
+                    2 => self.light_path_indices[tile] + 1,
+                    _ => unreachable!(),
+                };
+            }
+        }
+
+        let light_on_board = game.board.iter().filter(|&&piece| piece > 0).count() as u8;
+        let dark_on_board = game.board.iter().filter(|&&piece| piece < 0).count() as u8;
+        game.light_score = self.rules.pieces() - game.light_pieces - light_on_board;
+        game.dark_score = self.rules.pieces() - game.dark_pieces - dark_on_board;
+        game.finished = game.light_score >= self.rules.pieces();
+        game
+    }
+
+    #[inline]
+    fn scores(&self, key: u64) -> (u8, u8) {
+        let safe_bits = self.light_safe_indices.len();
+        let war_mask = (1u64 << self.segment_bits) - 1;
+        let board_mask = (1u64 << self.board_bits) - 1;
+        let war_bits = self.segment_count * self.segment_bits;
+        let board = key & board_mask;
+        let dark_safe = board & ((1u64 << safe_bits) - 1);
+        let war = (board >> safe_bits) & ((1u64 << war_bits) - 1);
+        let light_safe = board >> (safe_bits + war_bits);
+
+        let mut light_on_board = light_safe.count_ones() as u8;
+        let mut dark_on_board = dark_safe.count_ones() as u8;
+        for segment in 0..self.segment_count {
+            let shift = (self.segment_count - 1 - segment) * self.segment_bits;
+            let compressed = ((war >> shift) & war_mask) as usize;
+            let (light, dark) = self.decompression_counts[compressed];
+            light_on_board += light;
+            dark_on_board += dark;
+        }
+
+        let dark_pieces = ((key >> self.board_bits) & 0x7) as u8;
+        let light_pieces = ((key >> (self.board_bits + 3)) & 0x7) as u8;
+        (
+            self.rules.pieces() - light_pieces - light_on_board,
+            self.rules.pieces() - dark_pieces - dark_on_board,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MapLayout {
+    count: usize,
+    key_offset: usize,
+    value_offset: usize,
+}
+
+struct Lut {
+    data: Vec<u8>,
+    maps: Vec<MapLayout>,
+    prefix_starts: Vec<Vec<u32>>,
+    map_bases: Vec<usize>,
+    total: usize,
+    value_bytes: usize,
+    rules: RuleSet,
+    encoding: Encoding,
+    metadata: String,
+}
+
+impl Lut {
+    fn read(path: &Path) -> Self {
+        let started = Instant::now();
+        let data = fs::read(path).expect("failed to read LUT");
+        assert_eq!(&data[0..4], b"RGU\0");
+        let metadata_len = read_u32(&data, 4) as usize;
+        let metadata = String::from_utf8(data[8..8 + metadata_len].to_vec()).unwrap();
+        let metadata_lower = metadata.to_lowercase();
+        let value_bytes = if metadata_lower.contains("\"value_type\":\"f64\"") { 8 } else { 2 };
+        let rules = detect_ruleset(&metadata);
+
+        let mut cursor = 8 + metadata_len;
+        let map_count = read_u32(&data, cursor) as usize;
+        cursor += 4;
+        let mut counts = Vec::with_capacity(map_count);
+        for _ in 0..map_count {
+            counts.push(read_u32(&data, cursor) as usize);
+            cursor += 4;
+        }
+        let total = counts.iter().sum::<usize>();
+        let mut key_cursor = cursor;
+        let mut value_cursor = cursor + 4 * total;
+        let mut maps = Vec::with_capacity(map_count);
+        let mut map_bases = Vec::with_capacity(map_count);
+        let mut global_base = 0usize;
+        for &count in &counts {
+            map_bases.push(global_base);
+            maps.push(MapLayout { count, key_offset: key_cursor, value_offset: value_cursor });
+            key_cursor += 4 * count;
+            value_cursor += value_bytes * count;
+            global_base += count;
+        }
+        assert_eq!(value_cursor, data.len());
+
+        // Restrict each binary search to keys sharing the same top 20 bits.
+        // This keeps random lookups fast even in the 501-million-entry Masters map.
+        let mut prefix_starts = Vec::with_capacity(map_count);
+        for map in &maps {
+            let mut starts = vec![0u32; LOOKUP_PREFIX_COUNT + 1];
+            let mut index = 0usize;
+            for prefix in 0..=LOOKUP_PREFIX_COUNT {
+                while index < map.count
+                    && ((read_u32(&data, map.key_offset + 4 * index) as usize) >> LOOKUP_LOWER_BITS) < prefix
+                {
+                    index += 1;
+                }
+                starts[prefix] = index as u32;
+            }
+            prefix_starts.push(starts);
+        }
+        eprintln!(
+            "loaded {}: {:.3} GB, {} entries, {:.2}s",
+            rules.name(),
+            data.len() as f64 / 1e9,
+            total,
+            started.elapsed().as_secs_f64()
+        );
+        Self { data, maps, prefix_starts, map_bases, total, value_bytes, rules, encoding: Encoding::new(rules), metadata }
+    }
+
+    fn key_at(&self, upper: usize, index: usize) -> u64 {
+        let map = self.maps[upper];
+        assert!(index < map.count);
+        ((upper as u64) << 32) | read_u32(&self.data, map.key_offset + 4 * index) as u64
+    }
+
+    fn value_at(&self, upper: usize, index: usize) -> f64 {
+        let map = self.maps[upper];
+        if self.value_bytes == 8 {
+            read_f64(&self.data, map.value_offset + 8 * index)
+        } else {
+            read_u16(&self.data, map.value_offset + 2 * index) as f64 * 100.0 / 65535.0
+        }
+    }
+
+    fn key_value_at_global(&self, mut index: usize) -> (u64, f64) {
+        for upper in 0..self.maps.len() {
+            if index < self.maps[upper].count {
+                return (self.key_at(upper, index), self.value_at(upper, index));
+            }
+            index -= self.maps[upper].count;
+        }
+        panic!("global LUT index out of bounds");
+    }
+
+    fn lookup_key(&self, key: u64) -> f64 {
+        self.value_at_global(self.lookup_index(key))
+    }
+
+    fn lookup_index(&self, key: u64) -> usize {
+        let upper = (key >> 32) as usize;
+        assert!(upper < self.maps.len(), "upper key missing: {upper}");
+        let lower = key as u32;
+        let map = self.maps[upper];
+        let prefix = (lower >> LOOKUP_LOWER_BITS) as usize;
+        let mut lo = self.prefix_starts[upper][prefix] as usize;
+        let mut hi = self.prefix_starts[upper][prefix + 1] as usize;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let candidate = read_u32(&self.data, map.key_offset + 4 * mid);
+            match candidate.cmp(&lower) {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Greater => hi = mid,
+                Ordering::Equal => return self.map_bases[upper] + mid,
+            }
+        }
+        panic!("key missing from LUT: {key:#x}");
+    }
+
+    fn value_at_global(&self, mut index: usize) -> f64 {
+        for upper in 0..self.maps.len() {
+            if index < self.maps[upper].count {
+                return self.value_at(upper, index);
+            }
+            index -= self.maps[upper].count;
+        }
+        panic!("global LUT value index out of bounds");
+    }
+
+    fn light_win_percent(&self, game: &Game) -> f64 {
+        if game.finished {
+            return if game.light_score >= self.rules.pieces() { 100.0 } else { 0.0 };
+        }
+        let value = self.lookup_key(self.encoding.encode_symmetrical(game));
+        if game.is_light_turn { value } else { 100.0 - value }
+    }
+}
+
+fn read_u32(data: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_u16(data: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap())
+}
+
+fn read_f64(data: &[u8], offset: usize) -> f64 {
+    f64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
+#[derive(Clone, Copy)]
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self { Self(seed) }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn index(&mut self, length: usize) -> usize {
+        (self.next_u64() as usize) % length
+    }
+}
+
+fn choose_optimal_move(lut: &Lut, game: &Game, moves: &[i8]) -> i8 {
+    assert!(!moves.is_empty());
+    if moves.len() == 1 {
+        return moves[0];
+    }
+    let light_turn = game.is_light_turn;
+    let mut best_move = moves[0];
+    let mut best = if light_turn { f64::NEG_INFINITY } else { f64::INFINITY };
+    for &source in moves {
+        let mut next = game.clone();
+        next.apply_move(source, lut.rules);
+        let value = lut.light_win_percent(&next);
+        let better = if light_turn { value > best } else { value < best };
+        if better {
+            best = value;
+            best_move = source;
+        }
+    }
+    best_move
+}
+
+fn play_game(
+    lut: &Lut,
+    mut game: Game,
+    rng: &mut SplitMix64,
+    epsilon_percent: u8,
+    optimal_is_light: Option<bool>,
+) -> bool {
+    let mut move_buffer = [0i8; 8];
+    let mut plies = 0usize;
+    while !game.finished {
+        plies += 1;
+        assert!(plies < 100_000, "game failed to terminate");
+        let roll = lut.rules.roll(rng);
+        let move_count = game.apply_roll(roll, &mut move_buffer);
+        if move_count == 0 {
+            continue;
+        }
+
+        let current_is_optimal = optimal_is_light.map(|side| side == game.is_light_turn).unwrap_or(true);
+        let random_move = !current_is_optimal
+            && (rng.next_u64() % 10_000) < epsilon_percent as u64 * 100;
+        let source = if random_move {
+            move_buffer[rng.index(move_count)]
+        } else {
+            choose_optimal_move(lut, &game, &move_buffer[..move_count])
+        };
+        game.apply_move(source, lut.rules);
+    }
+    game.light_score >= lut.rules.pieces()
+}
+
+fn parallel_games(
+    lut: &Lut,
+    start_game: &Game,
+    games: usize,
+    seed: u64,
+    epsilon_percent: u8,
+    alternate_optimal_side: bool,
+) -> usize {
+    let threads = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(games.max(1));
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        let mut offset = 0usize;
+        for thread_index in 0..threads {
+            let count = games / threads + usize::from(thread_index < games % threads);
+            let first_game = offset;
+            offset += count;
+            let local_start = start_game.clone();
+            handles.push(scope.spawn(move || {
+                let mut rng = SplitMix64::new(
+                    seed ^ (thread_index as u64).wrapping_mul(0xd6e8feb86659fd93),
+                );
+                let mut wins = 0usize;
+                for local_index in 0..count {
+                    if alternate_optimal_side {
+                        let optimal_is_light = (first_game + local_index) % 2 == 0;
+                        let light_won = play_game(
+                            lut,
+                            local_start.clone(),
+                            &mut rng,
+                            epsilon_percent,
+                            Some(optimal_is_light),
+                        );
+                        wins += (light_won == optimal_is_light) as usize;
+                    } else {
+                        wins += play_game(
+                            lut,
+                            local_start.clone(),
+                            &mut rng,
+                            epsilon_percent,
+                            None,
+                        ) as usize;
+                    }
+                }
+                wins
+            }));
+        }
+        handles.into_iter().map(|handle| handle.join().unwrap()).sum()
+    })
+}
+
+fn verify(lut: &Lut, samples: usize) {
+    println!("ruleset={}", lut.rules.name());
+    println!("metadata={}", lut.metadata);
+    println!("entries={}", lut.total);
+    println!("maps={:?}", lut.maps.iter().map(|m| m.count).collect::<Vec<_>>());
+    let initial = Game::initial(lut.rules);
+    let initial_key = lut.encoding.encode_light_turn(&initial);
+    println!("initial_key={initial_key:#x}");
+    println!("initial_light_win_percent={:.10}", lut.lookup_key(initial_key));
+
+    let mut rng = SplitMix64::new(0x5eed_1234_abcd_9876);
+    let mut checked = 0usize;
+    let mut transition_checked = 0usize;
+    let mut moves = [0i8; 8];
+    while checked < samples {
+        let global = rng.index(lut.total);
+        let (key, stored) = lut.key_value_at_global(global);
+        let game = lut.encoding.decode(key);
+        let (light_score, dark_score) = lut.encoding.scores(key);
+        assert_eq!((light_score, dark_score), (game.light_score, game.dark_score), "score decoding mismatch");
+        let encoded = lut.encoding.encode_light_turn(&game);
+        assert_eq!(encoded, key, "encoding roundtrip failed");
+        let looked_up = lut.lookup_key(key);
+        assert!((stored - looked_up).abs() < 1e-12);
+        checked += 1;
+
+        if game.finished {
+            continue;
+        }
+        for &roll in lut.rules.possible_rolls() {
+            let mut rolled = game.clone();
+            let count = rolled.apply_roll(roll, &mut moves);
+            if count == 0 {
+                if !rolled.finished {
+                    let _ = lut.light_win_percent(&rolled);
+                    transition_checked += 1;
+                }
+            } else {
+                for &source in &moves[..count] {
+                    let mut next = rolled.clone();
+                    next.apply_move(source, lut.rules);
+                    let _ = lut.light_win_percent(&next);
+                    transition_checked += 1;
+                }
+            }
+        }
+    }
+    println!("roundtrips_checked={checked}");
+    println!("transitions_checked={transition_checked}");
+}
+
+fn write_gap_sample(lut: &Lut, path: &Path, state_samples: usize, seed: u64) {
+    let mut output = BufWriter::new(File::create(path).unwrap());
+    writeln!(output, "sample,key,roll,move_count,best_pct,second_pct,gap_pct,tie").unwrap();
+    let mut rng = SplitMix64::new(seed);
+    let mut moves = [0i8; 8];
+    let mut rows = 0usize;
+    let mut states = 0usize;
+    let started = Instant::now();
+    while states < state_samples {
+        let (key, _) = lut.key_value_at_global(rng.index(lut.total));
+        let game = lut.encoding.decode(key);
+        if game.finished {
+            continue;
+        }
+        states += 1;
+        for &roll in lut.rules.possible_rolls() {
+            let mut rolled = game.clone();
+            let count = rolled.apply_roll(roll, &mut moves);
+            if count <= 1 {
+                continue;
+            }
+            let mut best = f64::NEG_INFINITY;
+            let mut second = f64::NEG_INFINITY;
+            for &source in &moves[..count] {
+                let mut next = rolled.clone();
+                next.apply_move(source, lut.rules);
+                let value = lut.light_win_percent(&next);
+                if value > best {
+                    second = best;
+                    best = value;
+                } else if value > second {
+                    second = value;
+                }
+            }
+            let gap = best - second;
+            writeln!(
+                output,
+                "{states},{key:#x},{roll},{count},{best:.12},{second:.12},{gap:.12},{}",
+                gap == 0.0
+            ).unwrap();
+            rows += 1;
+        }
+        if states % 100_000 == 0 {
+            eprintln!("gap states={states}/{state_samples} rows={rows} elapsed={:.1}s", started.elapsed().as_secs_f64());
+        }
+    }
+    eprintln!("gap complete states={states} rows={rows} elapsed={:.1}s", started.elapsed().as_secs_f64());
+}
+
+fn write_compare(
+    lut: &Lut,
+    path: &Path,
+    state_count: usize,
+    games_per_state: usize,
+    seed: u64,
+) {
+    let mut output = BufWriter::new(File::create(path).unwrap());
+    writeln!(output, "state,key,predicted_pct,games,light_wins,simulated_pct").unwrap();
+    let mut sampling_rng = SplitMix64::new(seed);
+    let started = Instant::now();
+    for state_index in 0..state_count {
+        let (key, predicted) = loop {
+            let candidate = lut.key_value_at_global(sampling_rng.index(lut.total));
+            if !lut.encoding.decode(candidate.0).finished {
+                break candidate;
+            }
+        };
+        let start_game = lut.encoding.decode(key);
+        let game_seed = seed ^ key ^ (state_index as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        let wins = parallel_games(lut, &start_game, games_per_state, game_seed, 0, false);
+        let simulated = 100.0 * wins as f64 / games_per_state as f64;
+        writeln!(output, "{state_index},{key:#x},{predicted:.12},{games_per_state},{wins},{simulated:.12}").unwrap();
+        eprintln!(
+            "compare state={}/{} predicted={:.4}% simulated={:.4}% elapsed={:.1}s",
+            state_index + 1,
+            state_count,
+            predicted,
+            simulated,
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+fn write_epsilon(lut: &Lut, path: &Path, games_per_epsilon: usize, seed: u64) {
+    let mut output = BufWriter::new(File::create(path).unwrap());
+    writeln!(output, "epsilon,games,optimal_wins,optimal_win_pct").unwrap();
+    let started = Instant::now();
+    for epsilon in 0u8..=100 {
+        let epsilon_seed = seed ^ (epsilon as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        let optimal_wins = parallel_games(
+            lut,
+            &Game::initial(lut.rules),
+            games_per_epsilon,
+            epsilon_seed,
+            epsilon,
+            true,
+        );
+        let percent = 100.0 * optimal_wins as f64 / games_per_epsilon as f64;
+        writeln!(output, "{:.2},{games_per_epsilon},{optimal_wins},{percent:.12}", epsilon as f64 / 100.0).unwrap();
+        eprintln!("epsilon={epsilon}% optimal_win={percent:.4}% elapsed={:.1}s", started.elapsed().as_secs_f64());
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrainingMap {
+    count: usize,
+    base: usize,
+}
+
+struct TrainingLut {
+    keys: Vec<u32>,
+    values: Vec<f64>,
+    maps: Vec<TrainingMap>,
+    prefix_starts: Vec<Vec<u32>>,
+    rules: RuleSet,
+    encoding: Encoding,
+    metadata: String,
+}
+
+impl TrainingLut {
+    fn read_percent16(path: &Path) -> Self {
+        let started = Instant::now();
+        let mut input = BufReader::with_capacity(16 * 1024 * 1024, File::open(path).expect("failed to open LUT"));
+        let mut magic = [0u8; 4];
+        input.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, b"RGU\0");
+
+        let metadata_len = read_be_u32_from(&mut input) as usize;
+        let mut metadata_bytes = vec![0u8; metadata_len];
+        input.read_exact(&mut metadata_bytes).unwrap();
+        let metadata = String::from_utf8(metadata_bytes).unwrap();
+        let metadata_lower = metadata.to_lowercase();
+        assert!(
+            !metadata_lower.contains("\"value_type\"")
+                || metadata_lower.contains("\"value_type\":\"percent16\""),
+            "training input must use percent16 values"
+        );
+        let rules = detect_ruleset(&metadata);
+
+        let map_count = read_be_u32_from(&mut input) as usize;
+        let mut counts = Vec::with_capacity(map_count);
+        for _ in 0..map_count {
+            counts.push(read_be_u32_from(&mut input) as usize);
+        }
+        let total = counts.iter().sum::<usize>();
+        assert!(total <= u32::MAX as usize);
+
+        let mut maps = Vec::with_capacity(map_count);
+        let mut base = 0usize;
+        for &count in &counts {
+            maps.push(TrainingMap { count, base });
+            base += count;
+        }
+
+        let mut keys = Vec::with_capacity(total);
+        read_be_u32_vec(&mut input, total, &mut keys);
+        let mut values = Vec::with_capacity(total);
+        read_percent16_vec(&mut input, total, &mut values);
+        assert_eq!(keys.len(), total);
+        assert_eq!(values.len(), total);
+
+        let mut prefix_starts = Vec::with_capacity(map_count);
+        for map in &maps {
+            let map_keys = &keys[map.base..map.base + map.count];
+            let mut starts = vec![0u32; LOOKUP_PREFIX_COUNT + 1];
+            let mut index = 0usize;
+            for prefix in 0..=LOOKUP_PREFIX_COUNT {
+                while index < map.count && ((map_keys[index] as usize) >> LOOKUP_LOWER_BITS) < prefix {
+                    index += 1;
+                }
+                starts[prefix] = index as u32;
+            }
+            prefix_starts.push(starts);
+        }
+
+        eprintln!(
+            "loaded training map {}: {} entries, keys={:.3} GB, f64_values={:.3} GB, {:.2}s",
+            rules.name(),
+            total,
+            keys.len() as f64 * 4.0 / 1e9,
+            values.len() as f64 * 8.0 / 1e9,
+            started.elapsed().as_secs_f64()
+        );
+        Self {
+            keys,
+            values,
+            maps,
+            prefix_starts,
+            rules,
+            encoding: Encoding::new(rules),
+            metadata,
+        }
+    }
+
+    #[inline]
+    fn key_at_global(&self, global: usize) -> u64 {
+        for (upper, map) in self.maps.iter().enumerate() {
+            if global >= map.base && global < map.base + map.count {
+                return ((upper as u64) << 32) | self.keys[global] as u64;
+            }
+        }
+        panic!("global key index out of bounds: {global}");
+    }
+
+    #[inline]
+    fn lookup_index(&self, key: u64) -> usize {
+        let upper = (key >> 32) as usize;
+        assert!(upper < self.maps.len(), "upper key missing: {upper}");
+        let lower = key as u32;
+        let map = self.maps[upper];
+        let prefix = (lower >> LOOKUP_LOWER_BITS) as usize;
+        let map_keys = &self.keys[map.base..map.base + map.count];
+        let starts = &self.prefix_starts[upper];
+        let lo = starts[prefix] as usize;
+        let hi = starts[prefix + 1] as usize;
+        match map_keys[lo..hi].binary_search(&lower) {
+            Ok(local) => map.base + lo + local,
+            Err(_) => panic!("key missing from training LUT: {key:#x}"),
+        }
+    }
+
+    #[inline]
+    fn light_win_percent(&self, game: &Game, values: &[f64]) -> f64 {
+        if game.finished {
+            return if game.light_score >= self.rules.pieces() { 100.0 } else { 0.0 };
+        }
+        let index = self.lookup_index(self.encoding.encode_symmetrical(game));
+        let value = values[index];
+        if game.is_light_turn { value } else { 100.0 - value }
+    }
+
+    fn bellman_key(&self, key: u64, values: &[f64]) -> f64 {
+        let game = self.encoding.decode(key);
+        debug_assert!(!game.finished);
+        let mut total = 0.0;
+        let mut moves = [0i8; 8];
+        for (roll, &probability) in self.rules.roll_probabilities().iter().enumerate() {
+            if probability == 0.0 {
+                continue;
+            }
+            let mut rolled = game.clone();
+            let move_count = rolled.apply_roll(roll as u8, &mut moves);
+            let best = if move_count == 0 {
+                self.light_win_percent(&rolled, values)
+            } else {
+                let mut best = f64::NEG_INFINITY;
+                for &source in &moves[..move_count] {
+                    let mut next = rolled.clone();
+                    next.apply_move(source, self.rules);
+                    best = best.max(self.light_win_percent(&next, values));
+                }
+                best
+            };
+            total += probability * best;
+        }
+        total
+    }
+
+    fn write_f64(&self, output: &Path, target_precision: f64, training_precision: f64) {
+        let partial = output.with_extension("rgu.partial");
+        let mut writer = BufWriter::with_capacity(
+            16 * 1024 * 1024,
+            File::create(&partial).expect("failed to create f64 output"),
+        );
+        let metadata = format!(
+            "{{\"value_type\":\"f64\",\"target-precision\":{target_precision:.17e},\"training-precision\":{training_precision:.17e},{}",
+            &self.metadata[1..]
+        );
+        writer.write_all(b"RGU\0").unwrap();
+        writer.write_all(&(metadata.len() as u32).to_be_bytes()).unwrap();
+        writer.write_all(metadata.as_bytes()).unwrap();
+        writer.write_all(&(self.maps.len() as u32).to_be_bytes()).unwrap();
+        for map in &self.maps {
+            writer.write_all(&(map.count as u32).to_be_bytes()).unwrap();
+        }
+        let mut key_buffer = Vec::with_capacity(4 * 1_048_576);
+        for chunk in self.keys.chunks(1_048_576) {
+            key_buffer.clear();
+            for &key in chunk {
+                key_buffer.extend_from_slice(&key.to_be_bytes());
+            }
+            writer.write_all(&key_buffer).unwrap();
+        }
+        let mut value_buffer = Vec::with_capacity(8 * 524_288);
+        for chunk in self.values.chunks(524_288) {
+            value_buffer.clear();
+            for &value in chunk {
+                value_buffer.extend_from_slice(&value.to_be_bytes());
+            }
+            writer.write_all(&value_buffer).unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        fs::rename(&partial, output).expect("failed to move completed f64 output into place");
+    }
+}
+
+fn read_be_u32_from<R: Read>(input: &mut R) -> u32 {
+    let mut bytes = [0u8; 4];
+    input.read_exact(&mut bytes).unwrap();
+    u32::from_be_bytes(bytes)
+}
+
+fn read_be_u32_vec<R: Read>(input: &mut R, count: usize, output: &mut Vec<u32>) {
+    let mut bytes = vec![0u8; 4 * 1_048_576];
+    let mut remaining = count;
+    while remaining > 0 {
+        let chunk = remaining.min(1_048_576);
+        input.read_exact(&mut bytes[..4 * chunk]).unwrap();
+        output.extend(
+            bytes[..4 * chunk]
+                .chunks_exact(4)
+                .map(|value| u32::from_be_bytes(value.try_into().unwrap())),
+        );
+        remaining -= chunk;
+    }
+}
+
+fn read_percent16_vec<R: Read>(input: &mut R, count: usize, output: &mut Vec<f64>) {
+    let mut bytes = vec![0u8; 2 * 1_048_576];
+    let mut remaining = count;
+    while remaining > 0 {
+        let chunk = remaining.min(1_048_576);
+        input.read_exact(&mut bytes[..2 * chunk]).unwrap();
+        output.extend(bytes[..2 * chunk].chunks_exact(2).map(|value| {
+            u16::from_be_bytes(value.try_into().unwrap()) as f64 * 100.0 / 65535.0
+        }));
+        remaining -= chunk;
+    }
+}
+
+fn score_pairs(piece_count: u8) -> Vec<(u8, u8)> {
+    let mut pairs = Vec::new();
+    for min_score in (0..piece_count).rev() {
+        for max_score in (min_score..piece_count).rev() {
+            pairs.push((min_score, max_score));
+        }
+    }
+    pairs
+}
+
+fn layer_file(layer_dir: &Path, pair: (u8, u8)) -> PathBuf {
+    layer_dir.join(format!("layer_{:02}_{:02}.bin", pair.0, pair.1))
+}
+
+fn build_layer_files(lut: &TrainingLut, layer_dir: &Path) -> Vec<(u8, u8)> {
+    fs::create_dir_all(layer_dir).unwrap();
+    let pairs = score_pairs(lut.rules.pieces());
+    let mut pair_to_index = vec![usize::MAX; 64];
+    for (index, &(min_score, max_score)) in pairs.iter().enumerate() {
+        pair_to_index[min_score as usize * 8 + max_score as usize] = index;
+    }
+    let mut writers = pairs
+        .iter()
+        .map(|&pair| BufWriter::with_capacity(1024 * 1024, File::create(layer_file(layer_dir, pair)).unwrap()))
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let mut nonterminal = 0usize;
+    for global in 0..lut.keys.len() {
+        let key = lut.key_at_global(global);
+        let (light_score, dark_score) = lut.encoding.scores(key);
+        if light_score >= lut.rules.pieces() {
+            continue;
+        }
+        let min_score = light_score.min(dark_score);
+        let max_score = light_score.max(dark_score);
+        let layer = pair_to_index[min_score as usize * 8 + max_score as usize];
+        assert_ne!(layer, usize::MAX);
+        writers[layer].write_all(&(global as u32).to_le_bytes()).unwrap();
+        nonterminal += 1;
+        if global > 0 && global % 50_000_000 == 0 {
+            eprintln!(
+                "layer_index states={}/{} nonterminal={} elapsed_seconds={:.1}",
+                global,
+                lut.keys.len(),
+                nonterminal,
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    for writer in &mut writers {
+        writer.flush().unwrap();
+    }
+    eprintln!(
+        "layer_index complete states={} nonterminal={} elapsed_seconds={:.1}",
+        lut.keys.len(),
+        nonterminal,
+        started.elapsed().as_secs_f64()
+    );
+    pairs
+}
+
+fn read_layer_indices(path: &Path) -> Vec<u32> {
+    let size = fs::metadata(path).unwrap().len() as usize;
+    assert_eq!(size % 4, 0);
+    let count = size / 4;
+    let mut input = BufReader::with_capacity(16 * 1024 * 1024, File::open(path).unwrap());
+    let mut indices = Vec::with_capacity(count);
+    let mut bytes = vec![0u8; 4 * 1_048_576];
+    let mut remaining = count;
+    while remaining > 0 {
+        let chunk = remaining.min(1_048_576);
+        input.read_exact(&mut bytes[..4 * chunk]).unwrap();
+        indices.extend(
+            bytes[..4 * chunk]
+                .chunks_exact(4)
+                .map(|value| u32::from_le_bytes(value.try_into().unwrap())),
+        );
+        remaining -= chunk;
+    }
+    indices
+}
+
+fn training_iteration(lut: &TrainingLut, indices: &[u32]) -> (Vec<f64>, f64) {
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let chunk_size = (indices.len() + threads - 1) / threads;
+    let mut updates = vec![0.0f64; indices.len()];
+    let values = &lut.values;
+    let max_delta = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (index_chunk, update_chunk) in indices.chunks(chunk_size).zip(updates.chunks_mut(chunk_size)) {
+            handles.push(scope.spawn(move || {
+                let mut delta = 0.0f64;
+                for (slot, &global) in update_chunk.iter_mut().zip(index_chunk) {
+                    let global = global as usize;
+                    let value = lut.bellman_key(lut.key_at_global(global), values);
+                    delta = delta.max((value - values[global]).abs());
+                    *slot = value;
+                }
+                delta
+            }));
+        }
+        handles.into_iter().map(|handle| handle.join().unwrap()).fold(0.0, f64::max)
+    });
+    (updates, max_delta)
+}
+
+const CHECKPOINT_MAGIC: &[u8; 8] = b"RGUCHK1\0";
+
+fn load_checkpoint(
+    checkpoint: &Path,
+    lut: &mut TrainingLut,
+    layer_dir: &Path,
+    pairs: &[(u8, u8)],
+    required_tolerance: f64,
+) -> (Vec<bool>, Vec<f64>) {
+    let mut completed = vec![false; pairs.len()];
+    let mut precisions = vec![0.0; pairs.len()];
+    if !checkpoint.exists() {
+        let mut output = BufWriter::new(File::create(checkpoint).unwrap());
+        output.write_all(CHECKPOINT_MAGIC).unwrap();
+        output.write_all(&(lut.keys.len() as u64).to_le_bytes()).unwrap();
+        output.flush().unwrap();
+        return (completed, precisions);
+    }
+
+    let file_len = fs::metadata(checkpoint).unwrap().len();
+    let mut input = BufReader::with_capacity(16 * 1024 * 1024, File::open(checkpoint).unwrap());
+    let mut magic = [0u8; 8];
+    input.read_exact(&mut magic).unwrap();
+    assert_eq!(&magic, CHECKPOINT_MAGIC);
+    let mut total_bytes = [0u8; 8];
+    input.read_exact(&mut total_bytes).unwrap();
+    assert_eq!(u64::from_le_bytes(total_bytes) as usize, lut.keys.len());
+    let mut offset = 16u64;
+
+    loop {
+        if file_len < offset + 18 {
+            break;
+        }
+        let mut header = [0u8; 18];
+        input.read_exact(&mut header).unwrap();
+        let pair = (header[0], header[1]);
+        let count = u64::from_le_bytes(header[2..10].try_into().unwrap()) as usize;
+        let precision = f64::from_le_bytes(header[10..18].try_into().unwrap());
+        let record_end = offset + 18 + 8 * count as u64;
+        if file_len < record_end {
+            break;
+        }
+        let layer_index = pairs.iter().position(|&candidate| candidate == pair).unwrap();
+        let indices = read_layer_indices(&layer_file(layer_dir, pair));
+        assert_eq!(indices.len(), count);
+        let mut value_bytes = [0u8; 8];
+        for &global in &indices {
+            input.read_exact(&mut value_bytes).unwrap();
+            lut.values[global as usize] = f64::from_le_bytes(value_bytes);
+        }
+        completed[layer_index] = precision <= required_tolerance;
+        precisions[layer_index] = precision;
+        offset = record_end;
+        eprintln!("checkpoint restored scores=[{},{}] states={} precision={:.3e}", pair.0, pair.1, count, precision);
+    }
+    OpenOptions::new().write(true).open(checkpoint).unwrap().set_len(offset).unwrap();
+    (completed, precisions)
+}
+
+fn append_checkpoint(checkpoint: &Path, pair: (u8, u8), precision: f64, indices: &[u32], values: &[f64]) {
+    let file = OpenOptions::new().append(true).open(checkpoint).unwrap();
+    let mut output = BufWriter::with_capacity(16 * 1024 * 1024, file);
+    output.write_all(&[pair.0, pair.1]).unwrap();
+    output.write_all(&(indices.len() as u64).to_le_bytes()).unwrap();
+    output.write_all(&precision.to_le_bytes()).unwrap();
+    let mut buffer = Vec::with_capacity(8 * 524_288);
+    for chunk in indices.chunks(524_288) {
+        buffer.clear();
+        for &global in chunk {
+            buffer.extend_from_slice(&values[global as usize].to_le_bytes());
+        }
+        output.write_all(&buffer).unwrap();
+    }
+    output.flush().unwrap();
+    output.get_ref().sync_data().unwrap();
+}
+
+/// Which iteration scheme solves each score layer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Strategy {
+    /// Successors regenerated every sweep; deterministic Jacobi updates.
+    OnDemandJacobi,
+    /// Successor indices materialised once per layer; in-place Gauss-Seidel
+    /// sweeps, with convergence certified by a deterministic residual pass.
+    PrecomputedGaussSeidel,
+}
+
+impl Strategy {
+    fn name(self) -> &'static str {
+        match self {
+            Self::OnDemandJacobi => "ondemand-jacobi",
+            Self::PrecomputedGaussSeidel => "precomputed-gauss-seidel",
+        }
+    }
+}
+
+/// Solve one score layer with in-place Gauss-Seidel sweeps over a precomputed
+/// successor table, returning the certified residual.
+///
+/// Gauss-Seidel sweep deltas are timing dependent, so they are used only as a
+/// cheap progress signal: once a sweep looks converged, a deterministic
+/// residual pass decides whether the layer is actually done. The committed
+/// values therefore satisfy exactly the same criterion as the Jacobi path.
+fn solve_layer_gauss_seidel(
+    lut: &mut TrainingLut,
+    indices: &[u32],
+    pair: (u8, u8),
+    tolerance: f64,
+    max_iterations: usize,
+    started: &Instant,
+) -> f64 {
+    let build_started = Instant::now();
+    let successors = build_layer_successors(lut, indices);
+    eprintln!(
+        "train scores=[{},{}] successor_table entries={} bytes={:.3}GB build_seconds={:.2}",
+        pair.0,
+        pair.1,
+        successors.entries.len(),
+        successors.bytes() as f64 / 1e9,
+        build_started.elapsed().as_secs_f64()
+    );
+
+    // Guard against a successor-table bug silently producing wrong values: the
+    // precomputed Bellman update must agree exactly with the on-demand one.
+    // build_layer_successors already proves every successor key is present in
+    // the map (lookup_index panics otherwise); this checks the arithmetic.
+    let mut worst = 0.0f64;
+    let mut rng = SplitMix64::new(0x5bd1_e995_1234_9f3b ^ ((pair.0 as u64) << 8) ^ pair.1 as u64);
+    let checks = indices.len().min(2_000);
+    for _ in 0..checks {
+        let position = rng.index(indices.len());
+        let global = indices[position] as usize;
+        let expected = lut.bellman_key(lut.key_at_global(global), &lut.values);
+        let actual = successors.bellman(position, &lut.values);
+        worst = worst.max((expected - actual).abs());
+    }
+    assert!(
+        worst == 0.0,
+        "layer {pair:?}: precomputed successors disagree with on-demand Bellman by {worst:.3e}"
+    );
+    eprintln!("train scores=[{},{}] successor_check_states={checks} max_abs_diff=0", pair.0, pair.1);
+
+    let mut residual = f64::INFINITY;
+    let mut sweeps = 0usize;
+    while sweeps < max_iterations {
+        let sweep_started = Instant::now();
+        let delta = gauss_seidel_precomputed(&successors, indices, &mut lut.values);
+        sweeps += 1;
+        if sweeps <= 5 || sweeps % 10 == 0 || delta <= tolerance {
+            eprintln!(
+                "train scores=[{},{}] sweep={} max_delta={:.12e} seconds={:.2}",
+                pair.0,
+                pair.1,
+                sweeps,
+                delta,
+                sweep_started.elapsed().as_secs_f64()
+            );
+        }
+        if delta <= tolerance {
+            residual = residual_precomputed(&successors, indices, &lut.values);
+            eprintln!(
+                "train scores=[{},{}] certified_residual={:.12e} after sweeps={} elapsed_seconds={:.1}",
+                pair.0,
+                pair.1,
+                residual,
+                sweeps,
+                started.elapsed().as_secs_f64()
+            );
+            if residual <= tolerance {
+                break;
+            }
+        }
+    }
+    if residual > tolerance {
+        residual = residual_precomputed(&successors, indices, &lut.values);
+    }
+    residual
+}
+
+fn train_f64(
+    input: &Path,
+    output: &Path,
+    tolerance: f64,
+    max_iterations: usize,
+    strategy: Strategy,
+) {
+    assert!(tolerance > 0.0);
+    eprintln!("strategy={}", strategy.name());
+    let mut lut = TrainingLut::read_percent16(input);
+    let layer_dir = output.with_extension("layers");
+    let pairs = build_layer_files(&lut, &layer_dir);
+    let checkpoint = output.with_extension("checkpoint");
+    let (completed, mut precisions) = load_checkpoint(&checkpoint, &mut lut, &layer_dir, &pairs, tolerance);
+    let started = Instant::now();
+
+    for (layer_index, &pair) in pairs.iter().enumerate() {
+        if completed[layer_index] {
+            continue;
+        }
+        let indices = read_layer_indices(&layer_file(&layer_dir, pair));
+        eprintln!(
+            "train scores=[{},{}] states={} start elapsed_seconds={:.1}",
+            pair.0,
+            pair.1,
+            indices.len(),
+            started.elapsed().as_secs_f64()
+        );
+        let final_delta = match strategy {
+            Strategy::OnDemandJacobi => {
+                let mut final_delta = f64::INFINITY;
+                for iteration in 1..=max_iterations {
+                    let iteration_started = Instant::now();
+                    let (updates, delta) = training_iteration(&lut, &indices);
+                    for (&global, value) in indices.iter().zip(updates) {
+                        lut.values[global as usize] = value;
+                    }
+                    final_delta = delta;
+                    if iteration <= 5 || iteration % 10 == 0 || delta <= tolerance {
+                        eprintln!(
+                            "train scores=[{},{}] iteration={} max_delta={:.12e} seconds={:.2}",
+                            pair.0,
+                            pair.1,
+                            iteration,
+                            delta,
+                            iteration_started.elapsed().as_secs_f64()
+                        );
+                    }
+                    if delta <= tolerance {
+                        break;
+                    }
+                }
+                final_delta
+            }
+            Strategy::PrecomputedGaussSeidel => solve_layer_gauss_seidel(
+                &mut lut,
+                &indices,
+                pair,
+                tolerance,
+                max_iterations,
+                &started,
+            ),
+        };
+        assert!(final_delta <= tolerance, "layer {pair:?} did not converge within {max_iterations} iterations");
+        precisions[layer_index] = final_delta;
+        append_checkpoint(&checkpoint, pair, final_delta, &indices, &lut.values);
+        eprintln!(
+            "train scores=[{},{}] complete precision={:.12e} elapsed_seconds={:.1}",
+            pair.0,
+            pair.1,
+            final_delta,
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    let training_precision = precisions.into_iter().fold(0.0f64, f64::max);
+    eprintln!("writing f64 map {} precision={:.12e}", output.display(), training_precision);
+    lut.write_f64(output, tolerance, training_precision);
+}
+
+fn preflight_training(input: &Path, samples: usize) {
+    let lut = TrainingLut::read_percent16(input);
+    let mut rng = SplitMix64::new(0x763b_91a4_ef02_cd58);
+    let mut checked = 0usize;
+    let mut max_residual = 0.0f64;
+    while checked < samples {
+        let global = rng.index(lut.keys.len());
+        let key = lut.key_at_global(global);
+        let game = lut.encoding.decode(key);
+        let scores = lut.encoding.scores(key);
+        assert_eq!(scores, (game.light_score, game.dark_score));
+        assert_eq!(lut.lookup_index(key), global);
+        if game.finished {
+            continue;
+        }
+        let updated = lut.bellman_key(key, &lut.values);
+        max_residual = max_residual.max((updated - lut.values[global]).abs());
+        checked += 1;
+    }
+    println!("ruleset={}", lut.rules.name());
+    println!("entries={}", lut.keys.len());
+    println!("samples={checked}");
+    println!("sample_max_bellman_residual={max_residual:.12e}");
+}
+
+// ---------------------------------------------------------------------------
+// Precomputed-successor solver (benchmark path)
+//
+// The on-demand path re-decodes each state and re-runs a binary-search lookup
+// for every successor on every iteration. Because a score layer is iterated
+// many times, it is cheaper to materialise the successor indices for the layer
+// once and then let each sweep be a pure gather over that table.
+//
+// Only the layer currently being solved needs a successor table: successors
+// outside the layer have frozen values, so they are read by index like any
+// other. That keeps the table proportional to the layer rather than to the
+// whole 500,981,472-state map.
+// ---------------------------------------------------------------------------
+
+/// Successor entry: a sentinel for a terminal outcome, or a state index with a
+/// flag saying the stored light-win value must be complemented (dark to move).
+const SUCCESSOR_LIGHT_WIN: u32 = u32::MAX;
+const SUCCESSOR_DARK_WIN: u32 = u32::MAX - 1;
+const SUCCESSOR_COMPLEMENT: u32 = 1 << 31;
+const SUCCESSOR_INDEX_MASK: u32 = SUCCESSOR_COMPLEMENT - 1;
+
+struct LayerSuccessors {
+    /// Rolls with nonzero probability, paired with that probability.
+    active_rolls: Vec<(u8, f64)>,
+    /// CSR offsets, one run per (layer position, active roll).
+    offsets: Vec<u64>,
+    entries: Vec<u32>,
+}
+
+impl LayerSuccessors {
+    #[inline]
+    fn resolve(entry: u32, values: &[f64]) -> f64 {
+        match entry {
+            SUCCESSOR_LIGHT_WIN => 100.0,
+            SUCCESSOR_DARK_WIN => 0.0,
+            _ => {
+                let value = values[(entry & SUCCESSOR_INDEX_MASK) as usize];
+                if entry & SUCCESSOR_COMPLEMENT != 0 { 100.0 - value } else { value }
+            }
+        }
+    }
+
+    #[inline]
+    fn bellman(&self, position: usize, values: &[f64]) -> f64 {
+        let rolls = self.active_rolls.len();
+        let mut total = 0.0;
+        for (roll_slot, &(_, probability)) in self.active_rolls.iter().enumerate() {
+            let start = self.offsets[position * rolls + roll_slot] as usize;
+            let end = self.offsets[position * rolls + roll_slot + 1] as usize;
+            let mut best = f64::NEG_INFINITY;
+            for &entry in &self.entries[start..end] {
+                let candidate = Self::resolve(entry, values);
+                if candidate > best {
+                    best = candidate;
+                }
+            }
+            total += probability * best;
+        }
+        total
+    }
+
+    fn bytes(&self) -> usize {
+        self.offsets.len() * 8 + self.entries.len() * 4
+    }
+}
+
+/// Encode one successor game state as a `LayerSuccessors` entry.
+fn successor_entry(lut: &TrainingLut, game: &Game) -> u32 {
+    if game.finished {
+        return if game.light_score >= lut.rules.pieces() {
+            SUCCESSOR_LIGHT_WIN
+        } else {
+            SUCCESSOR_DARK_WIN
+        };
+    }
+    let index = lut.lookup_index(lut.encoding.encode_symmetrical(game));
+    assert!(index as u32 <= SUCCESSOR_INDEX_MASK, "state index does not fit in 31 bits: {index}");
+    let mut entry = index as u32;
+    if !game.is_light_turn {
+        entry |= SUCCESSOR_COMPLEMENT;
+    }
+    entry
+}
+
+/// Append the successor entries for one state and one roll, returning the count.
+fn push_successors(lut: &TrainingLut, key: u64, roll: u8, entries: &mut Vec<u32>) -> usize {
+    let game = lut.encoding.decode(key);
+    let mut moves = [0i8; 8];
+    let mut rolled = game;
+    let move_count = rolled.apply_roll(roll, &mut moves);
+    if move_count == 0 {
+        entries.push(successor_entry(lut, &rolled));
+        return 1;
+    }
+    for &source in &moves[..move_count] {
+        let mut next = rolled.clone();
+        next.apply_move(source, lut.rules);
+        entries.push(successor_entry(lut, &next));
+    }
+    move_count
+}
+
+fn build_layer_successors(lut: &TrainingLut, indices: &[u32]) -> LayerSuccessors {
+    let active_rolls = lut
+        .rules
+        .roll_probabilities()
+        .iter()
+        .enumerate()
+        .filter(|(_, &probability)| probability > 0.0)
+        .map(|(roll, &probability)| (roll as u8, probability))
+        .collect::<Vec<_>>();
+    let rolls = active_rolls.len();
+
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let chunk_size = (indices.len() + threads - 1) / threads;
+
+    // Each thread builds a contiguous chunk, so concatenating the per-chunk
+    // buffers in order reproduces the global CSR ordering.
+    let chunks: Vec<(Vec<u32>, Vec<u32>)> = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for index_chunk in indices.chunks(chunk_size.max(1)) {
+            let active_rolls = &active_rolls;
+            handles.push(scope.spawn(move || {
+                let mut entries = Vec::with_capacity(index_chunk.len() * rolls * 3);
+                let mut counts = Vec::with_capacity(index_chunk.len() * rolls);
+                for &global in index_chunk {
+                    let key = lut.key_at_global(global as usize);
+                    for &(roll, _) in active_rolls.iter() {
+                        let count = push_successors(lut, key, roll, &mut entries);
+                        counts.push(count as u32);
+                    }
+                }
+                (counts, entries)
+            }));
+        }
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    });
+
+    let total_entries = chunks.iter().map(|(_, entries)| entries.len()).sum::<usize>();
+    let mut offsets = Vec::with_capacity(indices.len() * rolls + 1);
+    let mut entries = Vec::with_capacity(total_entries);
+    let mut running = 0u64;
+    offsets.push(0);
+    for (counts, chunk_entries) in &chunks {
+        for &count in counts {
+            running += count as u64;
+            offsets.push(running);
+        }
+        entries.extend_from_slice(chunk_entries);
+    }
+    assert_eq!(offsets.len(), indices.len() * rolls + 1);
+    assert_eq!(entries.len(), total_entries);
+
+    LayerSuccessors { active_rolls, offsets, entries }
+}
+
+/// Deterministic Jacobi sweep over a precomputed layer table.
+fn jacobi_precomputed(successors: &LayerSuccessors, indices: &[u32], values: &[f64]) -> (Vec<f64>, f64) {
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let chunk_size = (indices.len() + threads - 1) / threads;
+    let mut updates = vec![0.0f64; indices.len()];
+    let max_delta = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let mut base = 0usize;
+        for (index_chunk, update_chunk) in
+            indices.chunks(chunk_size.max(1)).zip(updates.chunks_mut(chunk_size.max(1)))
+        {
+            let start = base;
+            base += index_chunk.len();
+            handles.push(scope.spawn(move || {
+                let mut delta = 0.0f64;
+                for (offset, (slot, &global)) in
+                    update_chunk.iter_mut().zip(index_chunk).enumerate()
+                {
+                    let value = successors.bellman(start + offset, values);
+                    delta = delta.max((value - values[global as usize]).abs());
+                    *slot = value;
+                }
+                delta
+            }));
+        }
+        handles.into_iter().map(|handle| handle.join().unwrap()).fold(0.0, f64::max)
+    });
+    (updates, max_delta)
+}
+
+/// Max residual |T(v) - v| over a layer, without writing values or allocating
+/// an update buffer. This is the deterministic convergence certificate.
+fn residual_precomputed(successors: &LayerSuccessors, indices: &[u32], values: &[f64]) -> f64 {
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let chunk_size = (indices.len() + threads - 1) / threads;
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let mut base = 0usize;
+        for index_chunk in indices.chunks(chunk_size.max(1)) {
+            let start = base;
+            base += index_chunk.len();
+            handles.push(scope.spawn(move || {
+                let mut delta = 0.0f64;
+                for (offset, &global) in index_chunk.iter().enumerate() {
+                    let value = successors.bellman(start + offset, values);
+                    delta = delta.max((value - values[global as usize]).abs());
+                }
+                delta
+            }));
+        }
+        handles.into_iter().map(|handle| handle.join().unwrap()).fold(0.0, f64::max)
+    })
+}
+
+/// Parallel in-place (Gauss-Seidel style) sweep over a precomputed layer table.
+///
+/// Threads publish updated values as they go, so later reads within the same
+/// sweep see newer values -- the asynchronous-value-iteration analogue of the
+/// serial Gauss-Seidel sweep in the Julia solver. Which updates a thread
+/// observes is timing dependent, so the returned delta is only an indication of
+/// progress; convergence is certified by a separate deterministic Jacobi
+/// residual sweep.
+///
+/// Values are accessed as relaxed atomics purely to make the concurrent
+/// reads/writes well defined; on x86-64 these compile to plain loads/stores.
+fn gauss_seidel_precomputed(successors: &LayerSuccessors, indices: &[u32], values: &mut [f64]) -> f64 {
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let chunk_size = (indices.len() + threads - 1) / threads;
+    let length = values.len();
+    let pointer = values.as_mut_ptr();
+    // Safety: f64 and AtomicU64 share size and alignment, and every access to
+    // the slice below goes through relaxed atomic operations for the duration
+    // of this function, so concurrent access is defined and cannot tear.
+    let atomics: &[AtomicU64] = unsafe { std::slice::from_raw_parts(pointer as *const AtomicU64, length) };
+
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let mut base = 0usize;
+        for index_chunk in indices.chunks(chunk_size.max(1)) {
+            let start = base;
+            base += index_chunk.len();
+            handles.push(scope.spawn(move || {
+                let mut delta = 0.0f64;
+                for (offset, &global) in index_chunk.iter().enumerate() {
+                    let position = start + offset;
+                    let value = bellman_atomic(successors, position, atomics);
+                    let previous =
+                        f64::from_bits(atomics[global as usize].load(AtomicOrdering::Relaxed));
+                    delta = delta.max((value - previous).abs());
+                    atomics[global as usize].store(value.to_bits(), AtomicOrdering::Relaxed);
+                }
+                delta
+            }));
+        }
+        handles.into_iter().map(|handle| handle.join().unwrap()).fold(0.0, f64::max)
+    })
+}
+
+#[inline]
+fn bellman_atomic(successors: &LayerSuccessors, position: usize, values: &[AtomicU64]) -> f64 {
+    let rolls = successors.active_rolls.len();
+    let mut total = 0.0;
+    for (roll_slot, &(_, probability)) in successors.active_rolls.iter().enumerate() {
+        let start = successors.offsets[position * rolls + roll_slot] as usize;
+        let end = successors.offsets[position * rolls + roll_slot + 1] as usize;
+        let mut best = f64::NEG_INFINITY;
+        for &entry in &successors.entries[start..end] {
+            let candidate = match entry {
+                SUCCESSOR_LIGHT_WIN => 100.0,
+                SUCCESSOR_DARK_WIN => 0.0,
+                _ => {
+                    let value = f64::from_bits(
+                        values[(entry & SUCCESSOR_INDEX_MASK) as usize].load(AtomicOrdering::Relaxed),
+                    );
+                    if entry & SUCCESSOR_COMPLEMENT != 0 { 100.0 - value } else { value }
+                }
+            };
+            if candidate > best {
+                best = candidate;
+            }
+        }
+        total += probability * best;
+    }
+    total
+}
+
+/// Compare the converged layer values recorded in a checkpoint against a
+/// finished f64 map, per score layer. Used to cross-check two independent runs
+/// (different machines, different iteration schemes) against each other.
+///
+/// Read-only: unlike `load_checkpoint` this never truncates a trailing partial
+/// record, it just stops there.
+fn compare_checkpoint(checkpoint: &Path, layer_dir: &Path, model: &Path) {
+    let lut = Lut::read(model);
+    let file_len = fs::metadata(checkpoint).unwrap().len();
+    let mut input = BufReader::with_capacity(16 * 1024 * 1024, File::open(checkpoint).unwrap());
+    let mut magic = [0u8; 8];
+    input.read_exact(&mut magic).unwrap();
+    assert_eq!(&magic, CHECKPOINT_MAGIC, "not a solver checkpoint: {}", checkpoint.display());
+    let mut total_bytes = [0u8; 8];
+    input.read_exact(&mut total_bytes).unwrap();
+    let checkpoint_states = u64::from_le_bytes(total_bytes) as usize;
+    println!("checkpoint_states={checkpoint_states}");
+    println!("model_states={}", lut.total);
+    assert_eq!(checkpoint_states, lut.total, "checkpoint and model cover different state counts");
+
+    let mut offset = 16u64;
+    let mut layers = 0usize;
+    let mut compared = 0usize;
+    let mut worst_overall = 0.0f64;
+    loop {
+        if file_len < offset + 18 {
+            break;
+        }
+        let mut header = [0u8; 18];
+        input.read_exact(&mut header).unwrap();
+        let pair = (header[0], header[1]);
+        let count = u64::from_le_bytes(header[2..10].try_into().unwrap()) as usize;
+        let precision = f64::from_le_bytes(header[10..18].try_into().unwrap());
+        let record_end = offset + 18 + 8 * count as u64;
+        if file_len < record_end {
+            println!("stopping at incomplete trailing record for scores=[{},{}]", pair.0, pair.1);
+            break;
+        }
+        let indices = read_layer_indices(&layer_file(layer_dir, pair));
+        assert_eq!(indices.len(), count, "layer [{},{}] index count does not match record", pair.0, pair.1);
+        let mut worst = 0.0f64;
+        let mut value_bytes = [0u8; 8];
+        for &global in &indices {
+            input.read_exact(&mut value_bytes).unwrap();
+            let recorded = f64::from_le_bytes(value_bytes);
+            let stored = lut.value_at_global(global as usize);
+            worst = worst.max((recorded - stored).abs());
+        }
+        worst_overall = worst_overall.max(worst);
+        compared += count;
+        layers += 1;
+        println!(
+            "layer scores=[{},{}] states={} checkpoint_precision={:.3e} max_abs_diff={:.6e}",
+            pair.0, pair.1, count, precision, worst
+        );
+        offset = record_end;
+    }
+    println!("layers_compared={layers} states_compared={compared}");
+    println!("max_abs_diff_overall={worst_overall:.6e}");
+}
+
+fn peak_rss_bytes() -> u64 {
+    // VmHWM is the kernel's high-water mark; absent on non-Linux hosts.
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            let kilobytes = rest.trim().trim_end_matches(" kB").trim();
+            return kilobytes.parse::<u64>().unwrap_or(0) * 1024;
+        }
+    }
+    0
+}
+
+/// Benchmark one score layer: preprocessing cost, per-sweep wall time and
+/// convergence rate for the on-demand Jacobi, precomputed Jacobi and
+/// precomputed Gauss-Seidel strategies.
+fn bench_layer(input: &Path, layer: (u8, u8), sweeps: usize, work_dir: &Path) {
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    println!("threads={threads}");
+
+    let load_started = Instant::now();
+    let mut lut = TrainingLut::read_percent16(input);
+    println!("map_load_seconds={:.2}", load_started.elapsed().as_secs_f64());
+    println!("total_states={}", lut.keys.len());
+
+    // Correctness gate: encoding round trips and successor agreement.
+    validate_encoding(&lut, 10_000);
+
+    fs::create_dir_all(work_dir).unwrap();
+    let layer_dir = work_dir.join("bench.layers");
+    let index_started = Instant::now();
+    if !layer_file(&layer_dir, layer).exists() {
+        build_layer_files(&lut, &layer_dir);
+    }
+    println!("layer_index_seconds={:.2}", index_started.elapsed().as_secs_f64());
+
+    // Every layer's state count, so total runtime can be extrapolated from a
+    // per-sweep cost measured on one layer.
+    let mut layer_total = 0u64;
+    for pair in score_pairs(lut.rules.pieces()) {
+        let path = layer_file(&layer_dir, pair);
+        let states = fs::metadata(&path).map(|meta| meta.len() / 4).unwrap_or(0);
+        layer_total += states;
+        println!("layer_size scores=[{},{}] states={}", pair.0, pair.1, states);
+    }
+    println!("layer_states_total={layer_total}");
+
+    let indices = read_layer_indices(&layer_file(&layer_dir, layer));
+    println!("layer=[{},{}] layer_states={}", layer.0, layer.1, indices.len());
+    if indices.is_empty() {
+        println!("layer is empty; nothing to benchmark");
+        return;
+    }
+
+    // --- Strategy A: on-demand successors, Jacobi (current production path).
+    let mut values_a = lut.values.clone();
+    let mut deltas_a = Vec::new();
+    let a_started = Instant::now();
+    for _ in 0..sweeps {
+        std::mem::swap(&mut lut.values, &mut values_a);
+        let (updates, delta) = training_iteration(&lut, &indices);
+        std::mem::swap(&mut lut.values, &mut values_a);
+        for (&global, value) in indices.iter().zip(updates) {
+            values_a[global as usize] = value;
+        }
+        deltas_a.push(delta);
+    }
+    let a_seconds = a_started.elapsed().as_secs_f64();
+    println!(
+        "ondemand_jacobi sweeps={} total_seconds={:.3} seconds_per_sweep={:.3}",
+        sweeps,
+        a_seconds,
+        a_seconds / sweeps as f64
+    );
+    println!("ondemand_jacobi_deltas={}", format_deltas(&deltas_a));
+
+    // --- Preprocessing for the precomputed strategies.
+    let build_started = Instant::now();
+    let successors = build_layer_successors(&lut, &indices);
+    let build_seconds = build_started.elapsed().as_secs_f64();
+    println!(
+        "successor_build_seconds={:.3} successor_entries={} successor_bytes={:.3}GB bytes_per_state={:.1}",
+        build_seconds,
+        successors.entries.len(),
+        successors.bytes() as f64 / 1e9,
+        successors.bytes() as f64 / indices.len() as f64
+    );
+
+    // Agreement check: precomputed Bellman must match the on-demand Bellman.
+    let mut worst = 0.0f64;
+    let mut rng = SplitMix64::new(0x5bd1_e995_1234_9f3b);
+    for _ in 0..10_000 {
+        let position = rng.index(indices.len());
+        let global = indices[position] as usize;
+        let expected = lut.bellman_key(lut.key_at_global(global), &lut.values);
+        let actual = successors.bellman(position, &lut.values);
+        worst = worst.max((expected - actual).abs());
+    }
+    println!("precomputed_vs_ondemand_max_abs_diff={worst:.3e}");
+    assert!(worst == 0.0, "precomputed successors disagree with on-demand Bellman");
+
+    // --- Strategy B: precomputed successors, Jacobi.
+    let mut values_b = lut.values.clone();
+    let mut deltas_b = Vec::new();
+    let b_started = Instant::now();
+    for _ in 0..sweeps {
+        let (updates, delta) = jacobi_precomputed(&successors, &indices, &values_b);
+        for (&global, value) in indices.iter().zip(updates) {
+            values_b[global as usize] = value;
+        }
+        deltas_b.push(delta);
+    }
+    let b_seconds = b_started.elapsed().as_secs_f64();
+    println!(
+        "precomputed_jacobi sweeps={} total_seconds={:.3} seconds_per_sweep={:.3}",
+        sweeps,
+        b_seconds,
+        b_seconds / sweeps as f64
+    );
+    println!("precomputed_jacobi_deltas={}", format_deltas(&deltas_b));
+
+    // --- Strategy C: precomputed successors, in-place Gauss-Seidel.
+    let mut values_c = lut.values.clone();
+    let mut deltas_c = Vec::new();
+    let c_started = Instant::now();
+    for _ in 0..sweeps {
+        deltas_c.push(gauss_seidel_precomputed(&successors, &indices, &mut values_c));
+    }
+    let c_seconds = c_started.elapsed().as_secs_f64();
+    println!(
+        "precomputed_gauss_seidel sweeps={} total_seconds={:.3} seconds_per_sweep={:.3}",
+        sweeps,
+        c_seconds,
+        c_seconds / sweeps as f64
+    );
+    println!("precomputed_gauss_seidel_deltas={}", format_deltas(&deltas_c));
+
+    // Residual after the same number of sweeps, measured identically for each
+    // strategy: one deterministic Jacobi residual pass, no values written.
+    for (name, values) in [("ondemand_jacobi", &values_a), ("precomputed_jacobi", &values_b), ("precomputed_gauss_seidel", &values_c)] {
+        let (_, residual) = jacobi_precomputed(&successors, &indices, values);
+        println!("{name}_residual_after_{sweeps}_sweeps={residual:.6e}");
+    }
+
+    println!("peak_rss_gb={:.3}", peak_rss_bytes() as f64 / 1e9);
+}
+
+fn format_deltas(deltas: &[f64]) -> String {
+    deltas.iter().map(|delta| format!("{delta:.3e}")).collect::<Vec<_>>().join(",")
+}
+
+/// Encoding round trips plus sampled successor validation.
+fn validate_encoding(lut: &TrainingLut, samples: usize) {
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+    let mut checked = 0usize;
+    let mut successors_checked = 0usize;
+    while checked < samples {
+        let global = rng.index(lut.keys.len());
+        let key = lut.key_at_global(global);
+        let game = lut.encoding.decode(key);
+        // Round trip: decode then re-encode must return the same key, and the
+        // key's score field must agree with the decoded position.
+        assert_eq!(lut.encoding.scores(key), (game.light_score, game.dark_score));
+        assert_eq!(lut.lookup_index(key), global, "key round trip failed");
+        if game.finished {
+            continue;
+        }
+        assert_eq!(lut.encoding.encode_symmetrical(&game), key, "encode(decode(key)) != key");
+        // Sampled successors: every generated successor must be a terminal
+        // position or a key present in the map.
+        let mut moves = [0i8; 8];
+        for (roll, &probability) in lut.rules.roll_probabilities().iter().enumerate() {
+            if probability == 0.0 {
+                continue;
+            }
+            let mut rolled = game.clone();
+            let move_count = rolled.apply_roll(roll as u8, &mut moves);
+            if move_count == 0 {
+                if !rolled.finished {
+                    lut.lookup_index(lut.encoding.encode_symmetrical(&rolled));
+                }
+                successors_checked += 1;
+                continue;
+            }
+            for &source in &moves[..move_count] {
+                let mut next = rolled.clone();
+                next.apply_move(source, lut.rules);
+                if !next.finished {
+                    lut.lookup_index(lut.encoding.encode_symmetrical(&next));
+                }
+                successors_checked += 1;
+            }
+        }
+        checked += 1;
+    }
+    println!("encoding_round_trips_checked={checked}");
+    println!("sampled_successors_checked={successors_checked}");
+}
+
+fn usage() -> ! {
+    eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>");
+    std::process::exit(2);
+}
+
+fn main() {
+    let args = env::args().collect::<Vec<_>>();
+    if args.len() < 3 {
+        usage();
+    }
+    let command = args[1].as_str();
+    let model = PathBuf::from(&args[2]);
+    if command == "preflight-train" {
+        let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
+        preflight_training(&model, samples);
+        return;
+    }
+    if command == "compare-checkpoint" {
+        if args.len() < 5 {
+            usage();
+        }
+        // model is args[2] = the checkpoint here.
+        compare_checkpoint(&model, Path::new(&args[3]), Path::new(&args[4]));
+        return;
+    }
+    if command == "bench-layer" {
+        if args.len() < 5 {
+            usage();
+        }
+        let min_score = args[3].parse::<u8>().expect("min-score must be an integer");
+        let max_score = args[4].parse::<u8>().expect("max-score must be an integer");
+        assert!(min_score <= max_score, "min-score must not exceed max-score");
+        let sweeps = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(10);
+        let work_dir = args
+            .get(6)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| model.parent().unwrap_or(Path::new(".")).join("bench"));
+        bench_layer(&model, (min_score, max_score), sweeps, &work_dir);
+        return;
+    }
+    if command == "train-f64" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let tolerance = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1e-12);
+        let max_iterations = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(10_000);
+        let strategy = match args.get(6).map(String::as_str) {
+            None | Some("ondemand-jacobi") => Strategy::OnDemandJacobi,
+            Some("precomputed-gauss-seidel") => Strategy::PrecomputedGaussSeidel,
+            Some(other) => {
+                eprintln!("unknown strategy: {other}");
+                usage();
+            }
+        };
+        train_f64(&model, &output, tolerance, max_iterations, strategy);
+        return;
+    }
+    let lut = Lut::read(&model);
+    match command {
+        "verify" => {
+            let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
+            verify(&lut, samples);
+        }
+        "analyze" => {
+            if args.len() < 4 {
+                usage();
+            }
+            let output_dir = PathBuf::from(&args[3]);
+            fs::create_dir_all(&output_dir).unwrap();
+            let gap_states = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+            let compare_states = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(100);
+            let games_per_state = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+            let games_per_epsilon = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+            let name = lut.rules.name();
+            write_gap_sample(&lut, &output_dir.join(format!("{name}_gaps.csv")), gap_states, 0x91a2_b3c4_d5e6_f701);
+            write_compare(&lut, &output_dir.join(format!("{name}_compare.csv")), compare_states, games_per_state, 0x1234_5678_9abc_def0);
+            write_epsilon(&lut, &output_dir.join(format!("{name}_epsilon.csv")), games_per_epsilon, 0xfedc_ba98_7654_3210);
+        }
+        _ => usage(),
+    }
+}

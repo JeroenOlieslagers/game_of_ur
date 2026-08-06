@@ -1,0 +1,6 @@
+name = "GameOfUr"
+uuid = "b1915b22-ec73-41b5-9068-6d24733a515b"
+version = "0.1.0"
+
+[compat]
+julia = "1.8"
