@@ -332,6 +332,11 @@ def main() -> None:
     learning_rate = float(argument("--lr", 2e-3))
     loss_kind = argument("--loss", "bce")
     tag = argument("--tag", "")
+    # Run-to-run spread is ~25% at a few thousand parameters and ~5% at half a
+    # million: small models are far more sensitive to initialisation. Without a
+    # controlled seed, two identical configurations differ by more than most of
+    # the effects being measured, so every comparison needs repeats.
+    seed = int(argument("--seed", 0))
     out_path = argument("--out", f"nn_{ruleset}_{arch}_{objective}.jsonl")
     train_successors = argument("--train-successors")
 
@@ -428,6 +433,7 @@ def main() -> None:
     handle = open(out_path, "a")
     for spec in sizes.split(","):
         width, depth = (int(part) for part in spec.lower().split("x"))
+        torch.manual_seed(seed)
         model = build(arch, width, depth, unpack, outputs, extra).to(device)
         parameters = sum(p.numel() for p in model.parameters())
         optimiser = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.0)
@@ -485,7 +491,7 @@ def main() -> None:
             "width": width, "depth": depth, "parameters": parameters,
             "bits": parameters * 32, "bits_per_state": parameters * 32 / state_count,
             "steps": steps, "batch": batch, "holdout_fraction": holdout_fraction,
-            "lr": learning_rate, "loss": loss_kind, "tag": tag,
+            "lr": learning_rate, "loss": loss_kind, "tag": tag, "seed": seed,
             "features": argument("--features", "none"),
             "seconds": round(time.time() - started, 1),
             "fit_mae": fit_mae, "fit_max_error": fit_max,

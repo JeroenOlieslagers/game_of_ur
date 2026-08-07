@@ -32,6 +32,7 @@ RULESET=${1:?ruleset required}
 OBJECTIVE=${2:-value}
 ARCH=${3:-mlp}
 FEATURES=${4:-none}
+SEED=${5:-0}
 DATA=${UR_STAGE2:-$UR_ROOT/stage2}/$RULESET
 RESULTS=${UR_STAGE2:-$UR_ROOT/stage2}/results
 mkdir -p "$RESULTS"
@@ -61,10 +62,10 @@ fi
 
 "$PYTHON" "$UR_ROOT/scripts/nn_sweep.py" "$RULESET" \
     "$DATA/tensors.bin" "$DATA/eval.csv" \
-    --objective "$OBJECTIVE" --arch "${ARCH:-mlp}" --features "$FEATURES" \
+    --objective "$OBJECTIVE" --arch "${ARCH:-mlp}" --features "$FEATURES" --seed "$SEED" \
     --sizes "$SIZES" \
     --steps 60000 \
-    --out "$RESULTS/nn_${RULESET}_${ARCH:-mlp}_${OBJECTIVE}_${FEATURES}.jsonl" \
+    --out "$RESULTS/nn_${RULESET}_${ARCH:-mlp}_${OBJECTIVE}_${FEATURES}_s${SEED}.jsonl" \
     "${EXTRA[@]}"
 
 echo "sweep complete for $RULESET/$OBJECTIVE"
