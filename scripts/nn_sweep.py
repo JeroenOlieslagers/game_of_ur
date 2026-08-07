@@ -285,7 +285,13 @@ def main() -> None:
         decisions_path = argument("--decisions")
         if not decisions_path:
             raise SystemExit("--decisions is required for the policy objective")
-        d_packed, d_roll, d_mask, d_best = load_decisions(decisions_path)
+        # Masters has ~1.9 billion decisions, or 27 GB once on the device.
+        # Capping keeps it inside a 48 GB GPU; the capped set is still three
+        # orders of magnitude larger than any model here, so it stays a
+        # compression problem rather than a memorisation one.
+        max_decisions = argument("--max-decisions")
+        d_packed, d_roll, d_mask, d_best = load_decisions(
+            decisions_path, int(max_decisions) if max_decisions else None)
         # The mask stays packed into an int32 and is expanded per batch. Held
         # as a bool matrix it would be 1.2 billion decisions x 17 classes for
         # Masters -- 20 GB to store what a shift and an AND recompute for free.

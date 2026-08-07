@@ -44,7 +44,8 @@ EXTRA=()
 if [[ $OBJECTIVE == ordering ]]; then
     EXTRA=(--train-successors "$DATA/train.csv")
 elif [[ $OBJECTIVE == policy ]]; then
-    EXTRA=(--decisions "$DATA/decisions.bin")
+    EXTRA=(--decisions "$DATA/decisions.bin"
+           --max-decisions "${UR_MAX_DECISIONS:-600000000}")
 fi
 
 "$PYTHON" "$UR_ROOT/scripts/nn_sweep.py" "$RULESET" \
