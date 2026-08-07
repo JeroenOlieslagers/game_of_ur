@@ -40,6 +40,16 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-32}
 PYTHON=${UR_VENV:-$UR_ROOT/.venv}/bin/python
 echo "host=$(hostname) ruleset=$RULESET objective=$OBJECTIVE threads=$OMP_NUM_THREADS"
 
+SIZES=${UR_SIZES:-}
+if [[ -z $SIZES ]]; then
+    # Capacity-matched ladders: both families span ~3k to ~7M parameters.
+    if [[ $ARCH == transformer ]]; then
+        SIZES=16x1,16x2,24x2,32x2,48x2,64x2,96x2,128x2,192x2,256x2,384x3,512x3
+    else
+        SIZES=32x2,64x2,128x2,256x2,512x3
+    fi
+fi
+
 EXTRA=()
 if [[ $OBJECTIVE == ordering ]]; then
     EXTRA=(--train-successors "$DATA/train.csv")
@@ -51,7 +61,7 @@ fi
 "$PYTHON" "$UR_ROOT/scripts/nn_sweep.py" "$RULESET" \
     "$DATA/tensors.bin" "$DATA/eval.csv" \
     --objective "$OBJECTIVE" --arch "${ARCH:-mlp}" \
-    --sizes 32x2,64x2,128x2,256x2,512x3 \
+    --sizes "$SIZES" \
     --steps 12000 \
     --batch 16384 \
     --out "$RESULTS/nncpu_${RULESET}_${ARCH:-mlp}_${OBJECTIVE}.jsonl" \
