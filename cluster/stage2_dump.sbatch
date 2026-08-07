@@ -49,7 +49,15 @@ echo "=== evaluation sets (fast, and they gate the big dump) ==="
 "$BINARY" dump-successors "$MAP" "$OUT/train.csv"        400000 onpolicy 0xa3e91f7c5b28d604
 
 echo "=== full table ==="
-"$BINARY" dump-tensors "$MAP" "$OUT/tensors.bin"
+# The successor files change whenever the CSV schema does; the table dump only
+# changes when the packing does, and it is the expensive half. Skipping an
+# existing one makes a schema change a thirty second job rather than an hour.
+if [[ -s $OUT/tensors.bin ]] && [[ -z ${UR_FORCE_TENSORS:-} ]]; then
+    echo "tensors.bin already present ($(stat -c%s "$OUT/tensors.bin") bytes); skipping"
+    echo "set UR_FORCE_TENSORS=1 to rewrite it"
+else
+    "$BINARY" dump-tensors "$MAP" "$OUT/tensors.bin"
+fi
 
 ls -la "$OUT"
 echo "dump complete for $RULESET"

@@ -132,6 +132,42 @@ class Successors:
         self.counts = np.diff(np.r_[self.offsets, len(self.position)])
         self.best = np.maximum.reduceat(self.value, self.offsets)
 
+        # Present only in dumps written after the policy-head change; a value
+        # model never looks at them.
+        if "parent" in rows[0]:
+            self.parent = np.array([int(r["parent"]) for r in rows], dtype=np.uint64)[self.offsets]
+            self.roll = np.array([int(r["roll"]) for r in rows], dtype=np.int64)[self.offsets]
+            self.source = np.array([int(r["source"]) for r in rows], dtype=np.int64)
+        else:
+            self.parent = self.roll = self.source = None
+
+    def path_length(self) -> int:
+        return len(PATHS[self.ruleset][0])
+
+    def policy_targets(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per position: the legal-source mask, the optimal source, and a map
+        from (position, source) back to the successor row.
+
+        Sources are indices into the mover's own path, shifted by one so that
+        entry from hand (-1) becomes class 0. Illegal sources are masked rather
+        than merely trained against, because a policy that picks an illegal move
+        has no defined regret.
+        """
+        if self.source is None:
+            raise ValueError("this dump predates the parent/roll/source columns")
+        classes = self.path_length() + 1
+        rows = len(self.offsets)
+        mask = np.zeros((rows, classes), dtype=bool)
+        row_of = np.full((rows, classes), -1, dtype=np.int64)
+        for row, (offset, count) in enumerate(zip(self.offsets, self.counts)):
+            local = self.source[offset:offset + count] + 1
+            mask[row, local] = True
+            row_of[row, local] = np.arange(offset, offset + count)
+        best_row = np.array([offset + np.argmax(self.value[offset:offset + count])
+                             for offset, count in zip(self.offsets, self.counts)])
+        best_source = self.source[best_row] + 1
+        return mask, best_source, row_of
+
     def __len__(self) -> int:
         return len(self.offsets)
 

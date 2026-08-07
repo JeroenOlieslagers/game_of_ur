@@ -30,6 +30,7 @@ source "${UR_ROOT:?export UR_ROOT when submitting}/cluster/env.sh"
 
 RULESET=${1:?ruleset required}
 OBJECTIVE=${2:-value}
+ARCH=${3:-mlp}
 DATA=${UR_STAGE2:-$UR_ROOT/stage2}/$RULESET
 RESULTS=${UR_STAGE2:-$UR_ROOT/stage2}/results
 mkdir -p "$RESULTS"
@@ -40,16 +41,16 @@ echo "host=$(hostname) ruleset=$RULESET objective=$OBJECTIVE"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 EXTRA=()
-if [[ $OBJECTIVE == ordering ]]; then
+if [[ $OBJECTIVE != value ]]; then
     EXTRA=(--train-successors "$DATA/train.csv")
 fi
 
 "$PYTHON" "$UR_ROOT/scripts/nn_sweep.py" "$RULESET" \
     "$DATA/tensors.bin" "$DATA/eval.csv" \
-    --objective "$OBJECTIVE" \
+    --objective "$OBJECTIVE" --arch "${ARCH:-mlp}" \
     --sizes 32x2,64x2,128x2,256x2,512x3,1024x3,2048x3 \
     --steps 60000 \
-    --out "$RESULTS/nn_${RULESET}_${OBJECTIVE}.jsonl" \
+    --out "$RESULTS/nn_${RULESET}_${ARCH:-mlp}_${OBJECTIVE}.jsonl" \
     "${EXTRA[@]}"
 
 echo "sweep complete for $RULESET/$OBJECTIVE"

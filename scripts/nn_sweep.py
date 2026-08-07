@@ -1,35 +1,50 @@
 #!/usr/bin/env python3
-"""Stage 2: the capacity sweep. Train MLPs of increasing size on the exact table.
+"""Stage 2: the capacity sweep. Fit models of increasing size to the exact table.
 
-One point on the rate-distortion curve per model size. The x axis is parameters
-(equivalently bits, at 32 per fp32 weight); the y axis is policy regret against
-the exact optimum, with value error reported alongside because stage 1 showed
-they disagree.
+One point on the rate-distortion curve per model size: parameters (equivalently
+bits, at 32 per fp32 weight) against policy regret, with value error alongside
+because stage 1 showed the two disagree.
 
-Two objectives, which is the point of the sweep rather than a detail:
+**No holdout by default.** The task is to reproduce *this* table in fewer bits,
+and every state in it is part of the object being compressed. Withholding a
+slice would measure interpolation to unseen positions -- a real question, but a
+different one, and answering it would mean deliberately compressing 95% of the
+object and reporting error on the other 5%. Pass `--holdout 0.05` to run that
+control; it is worth doing only at the top of the sweep, where the parameter
+count starts to approach the state count and "compression" could quietly become
+memorisation.
 
-  * **value** -- binary cross-entropy against the exact win probability. The
-    natural compression objective: reproduce the table.
-  * **ordering** -- a listwise softmax over the candidate successors of a
-    position, against the optimal move. The natural play objective.
+Three objectives, and the differences between them are the point:
 
-Stage 1 found the value fit had the higher R^2 and played 25-34% worse at 15
-parameters. That has to be a small-capacity effect -- as value error goes to
-zero regret must follow -- so the interesting measurement is the capacity at
-which the gap closes. Running both objectives at every size is what makes that
-visible.
+  * **value** -- BCE against the exact win probability. One forward pass per
+    candidate successor at play time.
+  * **ordering** -- listwise softmax over a position's successors. Still a
+    per-successor scorer, but trained on the ordering rather than the level.
+  * **policy** -- a head over the mover's own path indices, from the position
+    and the roll. One forward pass per *position*, and it never has to resolve
+    the sibling value gap at all, only its sign. Stage 1 found gaps below 1e-3
+    points deciding moves; a value net must represent those, a policy head must
+    not.
 
-The whole dump is held in GPU memory (1.7 GB for Finkel, 6 GB for Masters
-against an H200's 141 GB), so batching is pure device-side indexing and there is
-no dataloader in the loop.
+Two architectures:
+
+  * **mlp** -- per-tile one-hot into a dense stack. The generic approximator,
+    and the honest reference.
+  * **transformer** -- one token per path position for each player, with
+    self-attention. Capture, blocking and exposure are all *relations between
+    pieces*, which a dense net must learn from scratch and attention gets as an
+    inductive bias. Positional embeddings restore the ordinal meaning of "how
+    far along the path" that a per-tile one-hot throws away.
 
 Usage:
     nn_sweep.py <ruleset> <tensors.bin> <eval_successors.csv> [options]
-      --objective value|ordering    (default value)
-      --train-successors <csv>      required for the ordering objective
+      --arch mlp|transformer        (default mlp)
+      --objective value|ordering|policy
+      --train-successors <csv>      required for ordering and policy
       --sizes 64x2,256x2,1024x3     width x depth, comma separated
-      --steps N                     optimiser steps per model (default 40000)
+      --steps N                     (default 40000)
       --batch N                     (default 65536)
+      --holdout FRACTION            (default 0: train on everything)
       --out results.jsonl
 """
 
@@ -43,7 +58,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from ur_tensors import PIECES, Successors, load_tensors, usable_tiles  # noqa: E402
+from ur_tensors import PATHS, PIECES, Successors, load_tensors, usable_tiles  # noqa: E402
+
+MAX_ROLL = 8
 
 
 def argument(flag: str, default=None):
@@ -51,127 +68,238 @@ def argument(flag: str, default=None):
 
 
 class Unpacker:
-    """Packed words -> one-hot design, on the GPU.
+    """Packed words -> model inputs, on the GPU.
 
     Kept as a bit-twiddle rather than a stored float matrix because the
     expansion is 20x: Finkel is 1.1 GB packed against 38 GB one-hot. Unpacking
     per batch costs a few hundred microseconds and buys the ability to hold the
-    entire table on the device.
+    entire table in device memory.
     """
 
     def __init__(self, ruleset: str, device: torch.device):
+        self.ruleset = ruleset
+        self.device = device
         self.tiles = torch.tensor(usable_tiles(ruleset), device=device)
         self.pieces = PIECES[ruleset]
-        self.device = device
+        light, dark = PATHS[ruleset]
+        self.path_length = len(light)
+        self.paths = torch.tensor(list(light) + list(dark), device=device)
         self.width = 3 * len(self.tiles) + 2 * (self.pieces + 1)
 
-    def __call__(self, packed: torch.Tensor) -> torch.Tensor:
+    def hands(self, packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mover = ((packed >> 48) & 7).clamp(0, self.pieces)
+        other = ((packed >> 51) & 7).clamp(0, self.pieces)
+        return mover, other
+
+    def dense(self, packed: torch.Tensor) -> torch.Tensor:
+        """One-hot over tiles and hands, for the dense architecture."""
         rows = packed.shape[0]
-        shifts = (2 * self.tiles).view(1, -1)
-        codes = (packed.view(-1, 1) >> shifts) & 3
+        codes = (packed.view(-1, 1) >> (2 * self.tiles).view(1, -1)) & 3
         out = torch.zeros(rows, self.width, device=self.device)
         slots = torch.arange(len(self.tiles), device=self.device).view(1, -1)
         out.scatter_(1, 3 * slots + codes, 1.0)
         base = 3 * len(self.tiles)
         hand_width = self.pieces + 1
-        mover = ((packed >> 48) & 7).clamp(0, self.pieces).view(-1, 1)
-        other = ((packed >> 51) & 7).clamp(0, self.pieces).view(-1, 1)
-        out.scatter_(1, base + mover, 1.0)
-        out.scatter_(1, base + hand_width + other, 1.0)
+        mover, other = self.hands(packed)
+        out.scatter_(1, base + mover.view(-1, 1), 1.0)
+        out.scatter_(1, base + hand_width + other.view(-1, 1), 1.0)
         return out
 
+    def tokens(self, packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Occupancy along both players' paths, plus the two hand counts.
 
-def build(width: int, depth: int, inputs: int) -> torch.nn.Module:
-    layers: list[torch.nn.Module] = []
-    previous = inputs
-    for _ in range(depth):
-        layers += [torch.nn.Linear(previous, width), torch.nn.ReLU()]
-        previous = width
-    layers.append(torch.nn.Linear(previous, 1))
-    return torch.nn.Sequential(*layers)
+        Path indexing is what makes this worth doing: "position 5 of my path"
+        means the same thing for both colours, so a positional embedding carries
+        distance-to-home rather than an arbitrary board label.
+        """
+        occupancy = (packed.view(-1, 1) >> (2 * self.paths).view(1, -1)) & 3
+        mover, other = self.hands(packed)
+        return occupancy, torch.stack([mover, other], dim=1)
+
+
+class Dense(torch.nn.Module):
+    def __init__(self, width: int, depth: int, inputs: int, outputs: int):
+        super().__init__()
+        layers: list[torch.nn.Module] = []
+        previous = inputs
+        for _ in range(depth):
+            layers += [torch.nn.Linear(previous, width), torch.nn.ReLU()]
+            previous = width
+        layers.append(torch.nn.Linear(previous, outputs))
+        self.stack = torch.nn.Sequential(*layers)
+
+    def forward(self, dense, tokens, hands, extra=None):
+        if extra is not None:
+            dense = torch.cat([dense, extra], dim=1)
+        return self.stack(dense)
+
+
+class PieceTransformer(torch.nn.Module):
+    """Self-attention over path positions.
+
+    One token per path position per player, so a token is "the square five steps
+    along my route, occupied by whom". Attention then relates tokens directly,
+    which is the shape of every tactical fact in this game: a capture is a
+    relation between one of my pieces and one of theirs, a block is a relation
+    between a piece and a route. A dense net has to synthesise those from
+    independent per-tile weights.
+    """
+
+    def __init__(self, width: int, depth: int, path_length: int, pieces: int,
+                 outputs: int, extra: int = 0):
+        super().__init__()
+        self.path_length = path_length
+        tokens = 2 * path_length + 2
+        self.occupancy = torch.nn.Embedding(3, width)
+        self.position = torch.nn.Embedding(tokens, width)
+        self.hand = torch.nn.Embedding(pieces + 1, width)
+        layer = torch.nn.TransformerEncoderLayer(
+            d_model=width, nhead=max(1, width // 32), dim_feedforward=2 * width,
+            batch_first=True, norm_first=True, dropout=0.0)
+        self.encoder = torch.nn.TransformerEncoder(layer, depth)
+        self.head = torch.nn.Linear(width + extra, outputs)
+
+    def forward(self, dense, tokens, hands, extra=None):
+        board = self.occupancy(tokens)
+        hand = self.hand(hands)
+        sequence = torch.cat([board, hand], dim=1)
+        sequence = sequence + self.position.weight.unsqueeze(0)
+        pooled = self.encoder(sequence).mean(dim=1)
+        if extra is not None:
+            pooled = torch.cat([pooled, extra], dim=1)
+        return self.head(pooled)
+
+
+def build(arch: str, width: int, depth: int, unpack: Unpacker, outputs: int, extra: int):
+    if arch == "mlp":
+        return Dense(width, depth, unpack.width + extra, outputs)
+    if arch == "transformer":
+        return PieceTransformer(width, depth, unpack.path_length, unpack.pieces,
+                                outputs, extra)
+    raise SystemExit(f"unknown architecture: {arch}")
+
+
+def run(model, unpack, packed, extra=None):
+    return model(unpack.dense(packed), *unpack.tokens(packed), extra=extra)
 
 
 @torch.no_grad()
-def score_successors(model, unpack, packed: np.ndarray, device, batch=1 << 20) -> np.ndarray:
+def score_successors(model, unpack, packed_np, device, batch=1 << 19) -> np.ndarray:
     model.eval()
-    words = torch.from_numpy(packed.astype(np.int64)).to(device)
+    words = torch.from_numpy(packed_np.astype(np.int64)).to(device)
     out = torch.empty(len(words), device=device)
     for start in range(0, len(words), batch):
         chunk = words[start:start + batch]
-        out[start:start + batch] = torch.sigmoid(model(unpack(chunk)).squeeze(1)) * 100.0
+        out[start:start + batch] = torch.sigmoid(run(model, unpack, chunk).squeeze(1)) * 100.0
     model.train()
     return out.cpu().numpy().astype(np.float64)
 
 
 @torch.no_grad()
 def value_error(model, unpack, packed, values, device, sample=1 << 21):
-    """Mean and max absolute value error, in win-probability points."""
     index = torch.randint(0, len(packed), (min(sample, len(packed)),), device=device)
-    predicted = torch.sigmoid(model(unpack(packed[index])).squeeze(1)) * 100.0
+    predicted = torch.sigmoid(run(model, unpack, packed[index]).squeeze(1)) * 100.0
     error = (predicted - values[index]).abs()
     return float(error.mean()), float(error.max())
+
+
+def roll_onehot(roll: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.one_hot(roll.clamp(0, MAX_ROLL - 1), MAX_ROLL).float()
+
+
+@torch.no_grad()
+def policy_regret(model, unpack, evaluation, device) -> dict:
+    """Regret for a head that picks a source directly from position and roll."""
+    model.eval()
+    mask, best_source, row_of = evaluation.policy_targets()
+    parent = torch.from_numpy(evaluation.parent.astype(np.int64)).to(device)
+    roll = torch.from_numpy(evaluation.roll).to(device)
+    logits = torch.empty(len(parent), mask.shape[1], device=device)
+    for start in range(0, len(parent), 1 << 17):
+        chunk = slice(start, start + (1 << 17))
+        logits[chunk] = run(model, unpack, parent[chunk], extra=roll_onehot(roll[chunk]))
+    model.train()
+    legal = torch.from_numpy(mask).to(device)
+    chosen = logits.masked_fill(~legal, -1e9).argmax(dim=1).cpu().numpy()
+    picked = row_of[np.arange(len(chosen)), chosen]
+    assert (picked >= 0).all(), "policy chose a source with no successor row"
+    gap = evaluation.best - evaluation.value[picked]
+    return {"regret": float(np.mean(gap)), "p95": float(np.percentile(gap, 95)),
+            "max": float(np.max(gap)), "agreement": float(np.mean(gap < 1e-9))}
 
 
 def main() -> None:
     if len(sys.argv) < 4:
         raise SystemExit(__doc__)
     ruleset, tensors_path, eval_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    arch = argument("--arch", "mlp")
     objective = argument("--objective", "value")
     sizes = argument("--sizes", "32x2,64x2,128x2,256x2,512x3,1024x3,2048x3")
     steps = int(argument("--steps", 40000))
     batch = int(argument("--batch", 1 << 16))
-    out_path = argument("--out", f"nn_{ruleset}_{objective}.jsonl")
+    holdout_fraction = float(argument("--holdout", 0.0))
+    out_path = argument("--out", f"nn_{ruleset}_{arch}_{objective}.jsonl")
     train_successors = argument("--train-successors")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device} ruleset={ruleset} objective={objective}", flush=True)
+    print(f"device={device} ruleset={ruleset} arch={arch} objective={objective}", flush=True)
 
     unpack = Unpacker(ruleset, device)
     evaluation = Successors(eval_path, ruleset)
     print(f"eval set: {len(evaluation)} positions, {len(evaluation.packed)} successors")
 
     packed_np, values_np = load_tensors(tensors_path)
-    print(f"table: {len(packed_np)} states", flush=True)
     packed = torch.from_numpy(packed_np.astype(np.int64)).to(device)
     values = torch.from_numpy(values_np.astype(np.float32)).to(device)
 
-    # Hold out a twentieth of the table. At these capacities the gap is nil and
-    # this is insurance rather than the point -- but at the top of the sweep a
-    # model starts to have room to memorise, and that is exactly where a
-    # rate-distortion claim would quietly become false.
-    generator = torch.Generator(device="cpu").manual_seed(20250807)
-    shuffled = torch.randperm(len(packed), generator=generator).to(device)
-    holdout = shuffled[: len(packed) // 20]
-    train = shuffled[len(packed) // 20:]
-    print(f"train {len(train)}, holdout {len(holdout)}", flush=True)
+    if holdout_fraction > 0:
+        generator = torch.Generator(device="cpu").manual_seed(20250807)
+        shuffled = torch.randperm(len(packed), generator=generator).to(device)
+        cut = int(len(packed) * holdout_fraction)
+        holdout, train = shuffled[:cut], shuffled[cut:]
+        print(f"table: {len(packed)} states; train {len(train)}, holdout {len(holdout)}")
+    else:
+        # Every state is part of the object being compressed.
+        train = holdout = torch.arange(len(packed), device=device)
+        print(f"table: {len(packed)} states, all used for fitting", flush=True)
 
     groups = None
-    if objective == "ordering":
+    if objective in ("ordering", "policy"):
         if not train_successors:
-            raise SystemExit("--train-successors is required for the ordering objective")
+            raise SystemExit(f"--train-successors is required for the {objective} objective")
         training_set = Successors(train_successors, ruleset)
-        # Pad ragged sibling groups into a rectangle so the listwise softmax is
-        # one batched operation; padded slots are masked to -inf.
-        widest = int(training_set.counts.max())
-        rows = len(training_set)
-        slot = np.full((rows, widest), -1, dtype=np.int64)
-        for row, (offset, count) in enumerate(zip(training_set.offsets, training_set.counts)):
-            slot[row, :count] = np.arange(offset, offset + count)
-        groups = {
-            "slot": torch.from_numpy(slot).to(device),
-            "mask": torch.from_numpy(slot >= 0).to(device),
-            "packed": torch.from_numpy(training_set.packed.astype(np.int64)).to(device),
-            "passed": torch.from_numpy(training_set.passed.astype(np.float32)).to(device),
-            "best": torch.from_numpy(
-                np.argmax(np.where(slot >= 0, training_set.value[np.clip(slot, 0, None)], -1e9),
-                          axis=1)).to(device),
-        }
-        print(f"ordering training set: {rows} positions, widest group {widest}", flush=True)
+        if objective == "ordering":
+            widest = int(training_set.counts.max())
+            slot = np.full((len(training_set), widest), -1, dtype=np.int64)
+            for row, (offset, count) in enumerate(zip(training_set.offsets, training_set.counts)):
+                slot[row, :count] = np.arange(offset, offset + count)
+            groups = {
+                "slot": torch.from_numpy(slot).to(device),
+                "mask": torch.from_numpy(slot >= 0).to(device),
+                "packed": torch.from_numpy(training_set.packed.astype(np.int64)).to(device),
+                "passed": torch.from_numpy(training_set.passed.astype(np.float32)).to(device),
+                "best": torch.from_numpy(
+                    np.argmax(np.where(slot >= 0, training_set.value[np.clip(slot, 0, None)], -1e9),
+                              axis=1)).to(device),
+            }
+        else:
+            mask, best_source, _ = training_set.policy_targets()
+            groups = {
+                "parent": torch.from_numpy(training_set.parent.astype(np.int64)).to(device),
+                "roll": torch.from_numpy(training_set.roll).to(device),
+                "mask": torch.from_numpy(mask).to(device),
+                "best": torch.from_numpy(best_source).to(device),
+            }
+        print(f"{objective} training set: {len(training_set)} positions", flush=True)
+
+    classes = unpack.path_length + 1
+    outputs = classes if objective == "policy" else 1
+    extra = MAX_ROLL if objective == "policy" else 0
 
     handle = open(out_path, "a")
     for spec in sizes.split(","):
         width, depth = (int(part) for part in spec.lower().split("x"))
-        model = build(width, depth, unpack.width).to(device)
+        model = build(arch, width, depth, unpack, outputs, extra).to(device)
         parameters = sum(p.numel() for p in model.parameters())
         optimiser = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=0.0)
         schedule = torch.optim.lr_scheduler.OneCycleLR(optimiser, max_lr=2e-3, total_steps=steps)
@@ -180,26 +308,26 @@ def main() -> None:
         for step in range(steps):
             if objective == "value":
                 index = train[torch.randint(0, len(train), (batch,), device=device)]
-                # BCE against the exact probability as a soft target: better
-                # calibrated near 0 and 1 than MSE, which is where the decisive
-                # positions live.
-                logits = model(unpack(packed[index])).squeeze(1)
+                logits = run(model, unpack, packed[index]).squeeze(1)
                 loss = torch.nn.functional.binary_cross_entropy_with_logits(
                     logits, values[index] / 100.0)
-            else:
+            elif objective == "ordering":
                 rows = torch.randint(0, groups["slot"].shape[0], (batch // 16,), device=device)
                 slot = groups["slot"][rows]
                 mask = groups["mask"][rows]
                 flat = slot.clamp(min=0).reshape(-1)
-                logit = model(unpack(groups["packed"][flat])).squeeze(1)
-                value = torch.sigmoid(logit) * 100.0
-                # Score from the chooser's perspective: reflect about 50 exactly
-                # where the move hands the turn over.
+                value = torch.sigmoid(run(model, unpack, groups["packed"][flat]).squeeze(1)) * 100.0
+                # Reflect about 50 exactly where the move hands the turn over.
                 passed = groups["passed"][flat]
                 value = torch.where(passed > 0, 100.0 - value, value)
-                value = value.view(slot.shape)
-                value = value.masked_fill(~mask, -1e9)
+                value = value.view(slot.shape).masked_fill(~mask, -1e9)
                 loss = torch.nn.functional.cross_entropy(value, groups["best"][rows])
+            else:
+                rows = torch.randint(0, len(groups["parent"]), (batch // 4,), device=device)
+                logits = run(model, unpack, groups["parent"][rows],
+                             extra=roll_onehot(groups["roll"][rows]))
+                logits = logits.masked_fill(~groups["mask"][rows], -1e9)
+                loss = torch.nn.functional.cross_entropy(logits, groups["best"][rows])
 
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
@@ -208,25 +336,29 @@ def main() -> None:
             if step % 5000 == 0:
                 print(f"  {spec} step {step}/{steps} loss {loss.item():.5f}", flush=True)
 
-        scores = score_successors(model, unpack, evaluation.packed, device)
-        report = evaluation.regret(scores)
-        train_mae, train_max = value_error(model, unpack, packed[train], values[train], device)
-        hold_mae, hold_max = value_error(model, unpack, packed[holdout], values[holdout], device)
+        if objective == "policy":
+            report = policy_regret(model, unpack, evaluation, device)
+            fit_mae = fit_max = hold_mae = hold_max = float("nan")
+        else:
+            report = evaluation.regret(score_successors(model, unpack, evaluation.packed, device))
+            fit_mae, fit_max = value_error(model, unpack, packed[train], values[train], device)
+            hold_mae, hold_max = value_error(model, unpack, packed[holdout], values[holdout], device)
         record = {
-            "ruleset": ruleset, "objective": objective, "size": spec,
+            "ruleset": ruleset, "arch": arch, "objective": objective, "size": spec,
             "width": width, "depth": depth, "parameters": parameters,
             "bits": parameters * 32, "bits_per_state": parameters * 32 / len(packed_np),
-            "steps": steps, "batch": batch, "seconds": round(time.time() - started, 1),
-            "train_mae": train_mae, "train_max_error": train_max,
+            "steps": steps, "batch": batch, "holdout_fraction": holdout_fraction,
+            "seconds": round(time.time() - started, 1),
+            "fit_mae": fit_mae, "fit_max_error": fit_max,
             "holdout_mae": hold_mae, "holdout_max_error": hold_max,
             **report,
         }
         handle.write(json.dumps(record) + "\n")
         handle.flush()
         print(f"{spec}: {parameters} params  regret {report['regret']:.4f}  "
-              f"agreement {report['agreement']:.4f}  holdout MAE {hold_mae:.4f}  "
+              f"agreement {report['agreement']:.4f}  MAE {fit_mae:.4f}  "
               f"({record['seconds']}s)", flush=True)
-        torch.save(model.state_dict(), f"model_{ruleset}_{objective}_{spec}.pt")
+        torch.save(model.state_dict(), f"model_{ruleset}_{arch}_{objective}_{spec}.pt")
 
     handle.close()
 

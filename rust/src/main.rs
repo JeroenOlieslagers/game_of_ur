@@ -4025,7 +4025,11 @@ fn dump_successors(model: &Path, output: &Path, samples: usize, on_policy: bool,
     let lut = Lut::read(model);
     let mut rng = SplitMix64::new(seed);
     let mut file = BufWriter::new(File::create(output).unwrap());
-    writeln!(file, "position,move,passed,terminal,value_mover,packed").unwrap();
+    writeln!(
+        file,
+        "position,move,passed,terminal,value_mover,packed,parent,roll,source"
+    )
+    .unwrap();
 
     let mut moves = [0i8; 8];
     let mut game = Game::initial(lut.rules);
@@ -4057,15 +4061,24 @@ fn dump_successors(model: &Path, output: &Path, samples: usize, on_policy: bool,
             continue;
         }
         let mover_is_light = snapshot.is_light_turn;
+        // The parent state and roll let a model choose a move in ONE forward
+        // pass, scoring the position rather than each of its successors. A
+        // value network needs one pass per candidate and has to resolve
+        // sibling gaps that are often below 1e-3 win-probability points; a
+        // policy head only has to get their order right.
+        let parent = pack_position(&snapshot);
         for (index, &source) in moves[..count].iter().enumerate() {
             let mut next = snapshot.clone();
             next.apply_move(source, lut.rules);
             let passed = next.is_light_turn != mover_is_light;
             let light = lut.light_win_percent(&next);
             let value = if mover_is_light { light } else { 100.0 - light };
+            // `source` is an index into the mover's own path, with -1 meaning
+            // entry from hand. Path indices are unchanged by the reflection
+            // that canonicalises the board, so this needs no adjustment.
             writeln!(
                 file,
-                "{positions},{index},{},{},{value:.9},{}",
+                "{positions},{index},{},{},{value:.9},{},{parent},{roll},{source}",
                 u8::from(passed),
                 u8::from(next.finished),
                 pack_position(&next)
