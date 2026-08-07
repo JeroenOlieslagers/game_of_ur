@@ -125,6 +125,53 @@ inverts this ranking: `exposure_self` goes from -0.3 to -5.0 units of
 advancement, `threat_self` from +2.6 to +5.9, while `scored_self` is pulled down
 from +22.9 to +19.8.
 
+### Shapley over regret: what actually decides moves
+
+The decomposition above is over R^2. Redone in the currency that matters --
+mean regret removed as a feature enters -- over all 36 features. 2^36 subsets is
+out of reach, so this samples 120 random permutations (`scripts/shapley_regret.py`);
+values sum exactly to the total reduction by construction.
+
+Top eight per rule set, as a share of the total regret reduction:
+
+| rank | Blitz (0.616 -> 0.170) | Finkel (0.910 -> 0.220) | Masters (0.551 -> 0.133) |
+| --- | --- | --- | --- |
+| 1 | delta_exposure 14.8% | capture_value 17.2% | capture_value 16.8% |
+| 2 | delta_exposure_value 13.7% | captures 13.0% | delta_exposure_value 12.8% |
+| 3 | threat_self 10.8% | leaves_centre 10.4% | captures 12.1% |
+| 4 | safe_opp 9.2% | centre_opp 9.4% | delta_exposure 9.3% |
+| 5 | becomes_safe_forever 7.8% | delta_exposure_value 6.1% | threat_self 8.0% |
+| 6 | capture_value 6.7% | hand_self 5.7% | captures_frontmost 6.0% |
+| 7 | src_was_exposed 6.4% | enters 4.9% | hand_self 4.7% |
+| 8 | captures 4.4% | capture_gap_to_front 4.6% | threat_count 4.1% |
+
+Three things stand out.
+
+**The ranking inverts the R^2 one exactly as predicted.** `scored_self` and
+`scored_opp`, 48% of explained variance between them, are worth 1.0% and -2.2%
+of regret on blitz. `exposure` and `threat`, last for variance, are at the top
+for play. This is the same point as the value-versus-ordering fit, now measured
+directly on the features rather than inferred from two model fits.
+
+**Every rule set puts capture and exposure first, but weighted differently.**
+Finkel's top two are the capture features (30% combined) while its exposure
+features are mid-table; blitz and Masters lead with exposure. The reason is
+structural: in Finkel a piece is either in the 8-tile war zone or permanently
+safe, so the live question is *whether to take the capture available now*. On the
+Masters path, where 12 tiles are contested and safety is rarely permanent, the
+question is the standing risk you carry, which is what `delta_exposure` measures.
+
+**The magnitude and structure features earn their place.** They were added after
+error analysis, and four of them --`delta_exposure_value`, `capture_value`,
+`becomes_safe_forever`, `captures_frontmost` -- appear in the top eight of at
+least one rule set. `capture_value` alone is 17% of Finkel's total. A binary
+`captures` flag really does throw away most of what a capture decision is about.
+
+Small negative values (down to -2.2%) are expected: Shapley values under a
+non-monotone objective may be negative, and greedy regret is not monotone in the
+feature set because adding a feature can change the argmax adversely at some
+positions. Their size bounds the Monte Carlo error at roughly ±0.01 pp.
+
 ### Interpretable weights
 
 From the full-population value fit, in units of a square of advancement:
@@ -159,10 +206,45 @@ Depth applies only to *position* evaluators. Move features and decision lists
 score a transition, so at depth greater than one -- where the leaves are
 positions -- they have nothing to evaluate.
 
-Depths 1/2/3: `advancement` 0.852/0.540/0.508, `composite` 0.570/0.375/0.349,
-ordering-fitted 0.218/0.213/0.146. Lookahead does substitute for evaluator
-quality (`advancement` at depth 2 beats `composite` at depth 1), but the
-ordering-fitted evaluator at depth 1 beats every hand-tuned heuristic at depth 3.
+Expectimax over the four dice outcomes, leaves scored by a 15-weight state
+evaluator. The evaluator here is ordering-fitted over a stride-20 sample of
+*every* decision in the map (8.0M blitz, 26.3M finkel, 98.5M masters), not the
+60,000 on-policy positions used elsewhere, so its depth-1 number differs slightly
+from the model table above.
+
+| | d1 | d2 | d3 | d4 | d5 |
+| --- | --- | --- | --- | --- | --- |
+| blitz `advancement` | 1.2097 | 0.4699 | 0.3687 | 0.3239 | 0.2917 |
+| blitz `composite` | 0.5350 | 0.2234 | 0.1834 | 0.1303 | 0.1004 |
+| blitz fitted | 0.3031 | 0.1790 | 0.1276 | 0.0958 | **0.0768** |
+| finkel `advancement` | 0.8981 | 0.5246 | 0.5019 | 0.4411 | 0.4002 |
+| finkel `composite` | 0.6021 | 0.4035 | 0.3595 | 0.2953 | 0.2730 |
+| finkel fitted | 0.2825 | 0.2504 | 0.1987 | 0.1478 | **0.1311** |
+| masters `advancement` | 0.6508 | 0.2739 | 0.2439 | 0.2120 | 0.1882 |
+| masters `composite` | 0.4832 | 0.2535 | 0.2473 | 0.2235 | 0.2020 |
+| masters fitted | 0.2006 | 0.1930 | 0.1566 | 0.1132 | **0.0902** |
+
+Depth is monotone in regret everywhere, with no plateau by depth 5 -- the last
+step still buys 15-20%. It is not monotone in *agreement*: on Finkel,
+`advancement` and `composite` both agree with the optimal move slightly less
+often at depth 3 than at depth 2 while having lower regret. Deeper search trades
+a few cheap ties for the expensive decisions, which is the trade one wants.
+
+**Search substitutes for capacity, at a rule-set-dependent exchange rate.**
+Against the best depth-1 model in the table above (667 parameters), the
+15-parameter evaluator at depth 5 is better on blitz (0.0768 against 0.1052),
+level on Masters (0.0902 against 0.0922) and worse on Finkel (0.1311 against
+0.1136). Finkel resists search for the same reason it resists a linear score: its
+safe rosettes create discontinuities that neither smoothing nor averaging over
+dice will find.
+
+The exchange rate is not free. The depth-5 sweep takes 23-31 s against under
+0.05 s at depth 1-2 -- roughly 1000x the compute per decision, spent to save one
+memory lookup per weight. Where a table of 667 weights fits, it is the better
+buy; the case for depth is when parameters, not time, are the scarce resource.
+
+Lookahead also substitutes for evaluator quality: `advancement` at depth 2 beats
+`composite` at depth 1 on every rule set.
 
 ## Model complexity: a frontier, not a criterion
 
@@ -179,6 +261,36 @@ candidates costs no extra data passes.
 Optimism does enter through the *selection*: choosing the best of hundreds of
 candidates repeatedly is itself a fit. Positions are split, selection runs on
 one half, the curve is measured on the other.
+
+Held-out regret against number of terms, from 667 candidates (36 main effects and
+630 pairwise products):
+
+| terms | Blitz | Finkel | Masters |
+| --- | --- | --- | --- |
+| 1 | 0.3855 | 0.5174 | 0.3207 |
+| 2 | 0.2963 | 0.4147 | 0.2434 |
+| 4 | 0.2471 | 0.3567 | 0.1716 |
+| 6 | 0.2223 | 0.3016 | **0.1547** |
+| 8 | 0.2002 | 0.2487 | 0.1602 |
+| 10 | **0.1843** | 0.2281 | 0.1596 |
+| 12 | 0.1789 | **0.2028** | 0.1582 |
+| 18 | 0.1700 | 0.1908 | 0.1572 |
+
+The knees are at roughly 10 terms (blitz), 12 (Finkel) and 6 (Masters). Masters
+is done after six: terms 7 onward are flat to within noise, and by term 15 greedy
+selection is adding terms with no measurable gain at all. At the knee each rule
+set is within about 10% of its 37-parameter additive model using a quarter of the
+terms, and Finkel's 12-term model (0.2028) actually beats its additive one
+(0.2197).
+
+**Greedy selection almost never picks a main effect.** Across 54 selection steps
+over the three rule sets, only three main effects were chosen (`captures` and
+`enters` on Finkel, `captures` on blitz); everything else is a product. The
+selected products are overwhelmingly state x move -- `advancement_opp x
+capture_value`, `hand_opp x leaves_centre`, `threat_self x advance` -- which is
+the interaction reading it should be: a move feature's worth is conditional on
+the position. "Capture when you are behind" is one term, and it is not
+expressible as a sum of `advancement_opp` and `capture_value`.
 
 Use the full model for feature importance and the pruned model as the reportable
 heuristic. Do not read importance off the pruned model: among correlated
@@ -225,39 +337,90 @@ The value fit loses to the ordering fit in every rule set despite having the
 higher R^2 in every one; on Masters it is 34% worse. Interactions roughly halve
 regret everywhere.
 
-Masters is the easiest to approximate and Finkel the hardest, which fits the
-structure: Masters' twelve war tiles make captures routine, while Finkel's safe
-rosettes create sharper tactical distinctions that a smooth linear score cannot
-represent.
+Masters has the lowest regret and Finkel the highest, which fits the structure:
+Masters' twelve war tiles make captures routine, while Finkel's safe rosettes
+create sharper tactical distinctions that a smooth linear score cannot represent.
 
-## Regret is not win rate, and the gap is large
+Do **not** read this column as "Masters is easiest to play". Regret is per
+decision and Masters games hold roughly twice as many decisions as blitz ones, so
+the ordering reverses at the game level -- see the win-rate section below, where
+the Masters models lose more heavily than the blitz ones despite lower regret.
 
-The additive Finkel model gives up 0.213 percentage points of regret per move.
-Played against the optimal agent with sides alternating, it wins **28.76%**
-(20,000 games, standard error 0.35, ceiling 50%).
+## Regret is not win rate, and regret is not comparable across rule sets
 
-So a fifth of a point per move compounds into a **21-point** win-rate deficit --
-roughly a hundredfold amplification, because a game holds many decisions and the
-errors do not cancel. Anyone reading "0.2 pp regret" as "nearly optimal" would be
-badly wrong.
+Each policy compiled into the engine and played against the optimal agent with
+sides alternating, 1,000,000 games each (standard error 0.05, ceiling 50%).
 
-This is the clearest argument for reporting win rate and not only regret. Larger
-runs across all models and rule sets are in progress; with several (regret, win
-rate) pairs the relationship itself becomes measurable rather than assumed, and
-it is likely sub-linear at the strong end, since a model that rarely errs also
-rarely compounds errors.
+| Rule set | Model | regret | win % | deficit | deficit / regret |
+| --- | --- | --- | --- | --- | --- |
+| Blitz | additive (37) | 0.1699 | 39.31 | 10.69 | 63 |
+| Blitz | pairwise (667) | 0.1081 | **43.37** | 6.63 | 61 |
+| Finkel | additive | 0.2197 | 28.53 | 21.47 | 98 |
+| Finkel | pairwise | 0.1151 | **39.46** | 10.54 | 92 |
+| Masters | additive | 0.1334 | 33.50 | 16.50 | 124 |
+| Masters | pairwise | 0.0930 | **37.37** | 12.63 | 136 |
+
+**Amplification is enormous.** A fifth of a win-probability point given up per
+move compounds into a 21-point win-rate deficit on Finkel. Anyone reading
+"0.2 pp mean regret" as "nearly optimal" would be badly wrong: a game holds many
+decisions and the errors do not cancel.
+
+**The amplification factor is roughly constant within a rule set and very
+different between them** -- about 62 on blitz, 95 on Finkel, 130 on Masters.
+Within a rule set the deficit is close to linear in regret over the range
+measured, which is the useful practical fact: halving regret roughly halves the
+deficit, so the cheap exact metric is a sound optimisation target.
+
+Between rule sets it is not. Regret is a *per-decision* quantity, so converting
+it to a game-level deficit multiplies by the number of decisions per game, and
+Masters games hold about twice as many as blitz ones. This has a direct
+consequence for how the model table should be read: Masters shows the lowest
+regret of the three rule sets at every capacity, yet its models lose more badly
+than the blitz ones. **Masters is the easiest to approximate per move and the
+hardest to play well.** A cross-rule-set regret comparison is meaningless without
+the game-length factor, and the earlier reading of Masters as "easiest" was a
+per-move statement being mistaken for a strength statement.
+
+**Interactions buy far more game strength than regret suggests.** Going additive
+to pairwise cuts Finkel regret by 48% but converts a 21.5-point deficit into a
+10.5-point one -- the model goes from losing three games in four to nearly even.
+On blitz the pairwise model reaches 43.4% against a perfect opponent, which for
+667 weights against a 41-million-entry table is the headline number of this
+stage.
+
+The relationship shows no sign of the sub-linearity guessed at earlier; over
+0.09-0.22 pp of regret it is linear within each rule set. That may still bend
+closer to optimal, but nothing here measures it.
 
 ## What is not yet done
 
-- **Win rate against the optimal agent** for these models. Regret is a proxy; win
-  rate is the ground truth. It needs each model implemented inside the engine,
-  since playing a game means choosing moves online.
-- **Shapley over regret** rather than over R^2. The machinery exists; only the
-  R^2 decomposition has been run at scale.
-- **Blitz and Masters.** Everything above is Finkel. Masters has 12 war tiles
-  against Finkel's 8 and blitz grants an extra roll for a capture, so the feature
-  ranking should genuinely differ.
-- **Depths beyond 3**, running.
-- **Blocking and per-piece geometry** have no feature. The N-tuple network reads
-  board configurations directly and did add something on top of the scalars,
-  which suggests this gap is real.
+- **Win rate for the decision lists and DSL rules.** The linear policies are
+  compiled into the engine; the rule lists are not, which needs a DSL interpreter
+  on the Rust side. Their regret is known, but by the section above regret alone
+  does not settle strength.
+- **Blocking and per-piece geometry** have no feature. Two positions with the
+  same aggregate can differ in whether the opponent's route is obstructed, and
+  nothing in the 36 sees it. The N-tuple network reads board configurations
+  directly and did add something on top of the scalars, which suggests the gap is
+  real -- and it is a natural thing for stage 2 to recover on its own.
+- **Depth beyond 5**, which is still improving monotonically. Depth 6 is roughly
+  another 13x on the depth-5 cost, so it needs the search rewritten with move
+  ordering and pruning rather than a bigger allocation.
+- **A hybrid** of move features at the root over a position evaluator at the
+  leaves. Currently move-based policies are root-only and position evaluators get
+  the depth axis; the combination is untested and is the obvious best-of-both.
+
+## Reproducing
+
+```
+royalur_analysis dump-move-features --ruleset finkel --positions 60000 > mv.csv
+scripts/shapley_regret.py mv.csv --permutations 120     # feature importance
+scripts/prune_model.py mv.csv --terms 18                # complexity frontier
+scripts/export_policies.py mv.csv policies/finkel       # weights for the engine
+royalur_analysis winrate --ruleset finkel --weights policies/finkel/policy_pairwise.txt --games 1000000
+royalur_analysis depth-regret --ruleset finkel --max-depth 5
+```
+
+Cluster wrappers for all of these are in `cluster/`. Every number in this
+document is reproducible from a solved map plus these commands; none of them
+takes more than a few minutes except the depth-5 sweep and the 1M-game runs.
