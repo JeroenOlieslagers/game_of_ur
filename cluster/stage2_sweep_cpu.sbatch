@@ -31,6 +31,7 @@ source "${UR_ROOT:?export UR_ROOT when submitting}/cluster/env.sh"
 RULESET=${1:?ruleset required}
 OBJECTIVE=${2:-value}
 ARCH=${3:-mlp}
+FEATURES=${4:-none}
 DATA=${UR_STAGE2:-$UR_ROOT/stage2}/$RULESET
 RESULTS=${UR_STAGE2:-$UR_ROOT/stage2}/results
 mkdir -p "$RESULTS"
@@ -60,11 +61,11 @@ fi
 
 "$PYTHON" "$UR_ROOT/scripts/nn_sweep.py" "$RULESET" \
     "$DATA/tensors.bin" "$DATA/eval.csv" \
-    --objective "$OBJECTIVE" --arch "${ARCH:-mlp}" \
+    --objective "$OBJECTIVE" --arch "${ARCH:-mlp}" --features "$FEATURES" \
     --sizes "$SIZES" \
     --steps 12000 \
     --batch 16384 \
-    --out "$RESULTS/nncpu_${RULESET}_${ARCH:-mlp}_${OBJECTIVE}.jsonl" \
+    --out "$RESULTS/nncpu_${RULESET}_${ARCH:-mlp}_${OBJECTIVE}_${FEATURES}.jsonl" \
     "${EXTRA[@]}"
 
 echo "cpu sweep complete for $RULESET/$OBJECTIVE"
