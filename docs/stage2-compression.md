@@ -122,6 +122,53 @@ Two structural wins available cheaply:
   small parameter counts, which is exactly the regime of interest -- and it makes
   the left end of the curve continuous with stage 1 rather than a separate story.
 
+## Architecture
+
+The value network is the reference, not the answer. Three things vary.
+
+**Input representation.** The baseline is per-tile one-hot over 20 slots plus
+both hands, 76 inputs. Two known weaknesses: it discards the *ordinal* meaning of
+a position, so "how far along my path" has to be relearned as a weighted sum of
+independent tile symbols; and it has no relational structure, while capture,
+blocking and exposure are all relations *between* pieces. Path indexing fixes the
+first for free -- "position 5 of my path" means the same thing for both colours.
+
+**Head.** A value head must represent V accurately enough to resolve the *sibling
+gap*, which stage 1 found is often below 1e-3 win-probability points. A **policy
+head** -- logits over the mover's own path indices, given the position and the
+roll, with illegal sources masked -- only has to get the *sign* of that gap
+right, and it chooses a move in one forward pass rather than one per successor.
+This is the direct architectural consequence of stage 1's value-versus-ordering
+result, and the prediction is that it dominates on regret per parameter.
+
+Keep the two claims separate when writing up: a policy head is not a value
+function, so it cannot sit at the leaves of a depth search and cannot be compared
+against the quantisation reference on equal terms. Value models anchor the
+rate-distortion curve; the policy head answers the different question of what the
+cheapest thing that *plays* well is.
+
+**Attention.** A set encoder over path positions -- one token per path position
+per player, self-attention between them, positional embeddings carrying
+distance-to-home -- supplies exactly the relational bias the dense stack lacks,
+at ~34 tokens and negligible cost. This is the sharp version of Q3: if a
+relational bias moves the envelope, the envelope was about the model; if it does
+not, it was about the game.
+
+### What does not apply
+
+**A VAE.** There is no generative task and no distribution to sample: state ->
+value is a deterministic function for which exact labels exist everywhere. The KL
+term buys a smooth stochastic latent with nothing to use it. A plain autoencoder
+over the table would technically be compression, but the function-approximation
+framing strictly dominates it, because it exploits input structure the
+autoencoder would have to rediscover.
+
+**A sequence model over game history.** The game is Markov and fully observed, so
+history is redundant by construction.
+
+**Learning the dynamics.** Predicting the next state burns capacity on a function
+that is already known exactly and costs nanoseconds to compute.
+
 ## Protocol
 
 **Training distribution.** Compression and play want different ones, and saying
@@ -130,11 +177,20 @@ the table; it over-weights positions no game reaches. On-policy is correct for
 play strength. Train both at three capacities; expect the difference to matter at
 small capacity and vanish at large, for the same reason as Q2.
 
-**Holdout.** Hold out states, but be honest about what it measures. With 100k
-parameters against 137M states memorisation is impossible and the train/test gap
-will be nil; the holdout is insurance, not the point. It becomes load-bearing at
-the right-hand end, where 10M parameters against 41M blitz states can genuinely
-start to memorise.
+**No holdout.** The task is to reproduce *this* table in fewer bits, and every
+state in it is part of the object being compressed. Withholding a slice would
+mean compressing 95% of the object and reporting error on the other 5%, which
+measures interpolation to unseen positions -- a real question, but a different
+one, and not the one a rate-distortion curve answers. Models are fitted on the
+whole table.
+
+The exception is a **memorisation control** at the top of the sweep. "Compression"
+is only a meaningful word while the parameter count is far below the state count;
+at 10M parameters against 41M blitz states that stops being obviously true, and a
+holdout is the way to check. Run it there, as a diagnostic on a specific claim,
+not as a blanket protocol. At the sizes measured so far it is moot -- 563k
+parameters against 41M states is 73 states per parameter, and holdout error
+tracked fitted error.
 
 **Metrics.** Mean and max absolute error in win-probability points (the
 compression view), policy regret and move agreement (the play view), and win rate
