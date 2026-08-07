@@ -4029,13 +4029,20 @@ fn expectimax_pruned(
         remaining -= probability;
         // The window this child must land in for the chance node still to
         // matter; untried outcomes are bounded by the value range [0, 100].
-        let (child_alpha, child_beta) = if star {
-            let low = (alpha - accumulated - 100.0 * remaining) / probability;
-            let high = (beta - accumulated) / probability;
-            (low.max(0.0), high.min(100.0))
+        // Two distinct quantities, and conflating them is a bug: `low`/`high`
+        // are the true bounds a child must break to change this node's value,
+        // and can lie outside [0, 100] because they are divided by a
+        // probability; `child_alpha`/`child_beta` are the search window handed
+        // down, which must be a valid value range. Testing the cutoff against a
+        // clamped bound makes a single winning roll look like a fail-high and
+        // returns 100 for a node whose value is an expectation, not a maximum.
+        let (low, high) = if star {
+            ((alpha - accumulated - 100.0 * remaining) / probability,
+             (beta - accumulated) / probability)
         } else {
-            (0.0, 100.0)
+            (f64::NEG_INFINITY, f64::INFINITY)
         };
+        let (child_alpha, child_beta) = (low.max(0.0), high.min(100.0));
 
         let mut rolled = game.clone();
         let count = rolled.apply_roll(roll as u8, &mut moves);
@@ -4072,8 +4079,8 @@ fn expectimax_pruned(
         };
 
         if star {
-            if value <= child_alpha { result = Some(alpha); break; }
-            if value >= child_beta { result = Some(beta); break; }
+            if value <= low { result = Some(alpha); break; }
+            if value >= high { result = Some(beta); break; }
         }
         accumulated += probability * value;
     }
