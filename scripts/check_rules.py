@@ -33,6 +33,8 @@ def main() -> None:
     rows = list(csv.DictReader(open(sys.argv[2])))
     names = [k for k in rows[0] if k not in META]
     columns = {n: np.array([float(r[n]) for r in rows]) for n in names}
+    # rule_dsl broadcasts bare numeric literals to this length.
+    columns["__rows__"] = len(rows)
     values = np.array([float(r["value_mover"]) for r in rows])
     state = np.array([int(r["state"]) for r in rows])
     offsets = np.flatnonzero(np.r_[True, state[1:] != state[:-1]])

@@ -200,6 +200,16 @@ predicates. Rules are parsed by a recursive-descent parser rather than evaluated
 so generated text is safe to run; of 992 proposals, 0 were rejected and 59 never
 discriminated.
 
+Played against the optimal agent it wins **21.65%** (1,000,000 games, standard
+error 0.05). This required porting the rule language into the engine, since
+playing a game means choosing moves online. The two implementations -- the
+vectorised Python one used for selection, and a recursive-descent parser in Rust
+used for play -- agree exactly on the same 60,000 positions: identical counts for
+all seven rules and mean regret matching to six decimal places (0.318780). Two
+hand-written parsers for one grammar is a place where a divergence yields a
+plausible wrong number rather than an error, so the agreement is checked rather
+than assumed (`check-rules` against `scripts/check_rules.py`).
+
 ### Search depth
 
 Depth applies only to *position* evaluators. Move features and decision lists
@@ -371,6 +381,22 @@ Within a rule set the deficit is close to linear in regret over the range
 measured, which is the useful practical fact: halving regret roughly halves the
 deficit, so the cheap exact metric is a sound optimisation target.
 
+That constancy holds across *model families*, not just across sizes of one
+family, which is the stronger claim and the one that licenses using regret as an
+objective. On Finkel:
+
+| model | regret | deficit | ratio |
+| --- | --- | --- | --- |
+| 7-rule decision list | 0.3188 | 28.35 | 88.9 |
+| additive linear, 37 params | 0.2197 | 21.47 | 97.7 |
+| pairwise linear, 667 params | 0.1151 | 10.54 | 91.6 |
+
+A priority list of boolean rules, a linear score and a linear score with
+interactions are about as structurally different as three policies can be, and
+over a threefold range of regret they sit on one line to within 5%. The
+prediction for the decision list from the linear models' factor was ~20%; it
+scored 21.65%.
+
 Between rule sets it is not. Regret is a *per-decision* quantity, so converting
 it to a game-level deficit multiplies by the number of decisions per game, and
 Masters games hold about twice as many as blitz ones. This has a direct
@@ -394,18 +420,16 @@ closer to optimal, but nothing here measures it.
 
 ## What is not yet done
 
-- **Win rate for the decision lists and DSL rules.** The linear policies are
-  compiled into the engine; the rule lists are not, which needs a DSL interpreter
-  on the Rust side. Their regret is known, but by the section above regret alone
-  does not settle strength.
 - **Blocking and per-piece geometry** have no feature. Two positions with the
   same aggregate can differ in whether the opponent's route is obstructed, and
   nothing in the 36 sees it. The N-tuple network reads board configurations
   directly and did add something on top of the scalars, which suggests the gap is
   real -- and it is a natural thing for stage 2 to recover on its own.
-- **Depth beyond 5**, which is still improving monotonically. Depth 6 is roughly
-  another 13x on the depth-5 cost, so it needs the search rewritten with move
-  ordering and pruning rather than a bigger allocation.
+- **Depth beyond 7.** Depths 1-7 are running; regret was still falling 15-20%
+  per ply at depth 5 with no sign of saturation, and depth 6 confirms it
+  continues (Finkel `advancement` 0.4047 -> 0.3324). Each ply costs about 13.5x
+  the last, so depth 8 needs the search rewritten with move ordering and pruning
+  rather than a bigger allocation.
 - **A hybrid** of move features at the root over a position evaluator at the
   leaves. Currently move-based policies are root-only and position evaluators get
   the depth axis; the combination is untested and is the obvious best-of-both.
