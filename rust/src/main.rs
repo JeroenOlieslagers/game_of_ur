@@ -4007,6 +4007,88 @@ fn dump_tensors(model: &Path, output: &Path, stride: usize, offset: usize) {
     );
 }
 
+/// Stage 2: every decision in the game, as (position, roll) -> optimal source.
+///
+/// This is the training set for a policy head, and it exists because a sampled
+/// one is the wrong object. The value objective fits all 41M table states, so
+/// "compression" means something: the model is far smaller than what it
+/// reproduces. A policy trained on a 400k-position sample instead compresses a
+/// 313k-pair object, which a 575k-parameter model simply memorises -- and since
+/// on-policy sampling revisits the same early-game states, an on-policy
+/// evaluation set drawn separately turned out to be 100% contained in it.
+/// Enumerating the whole decision space removes both problems at once.
+///
+/// Twelve bytes per record, little-endian: `u64` packed position, `u8` roll,
+/// `u16` mask of legal source classes, `u8` optimal source class. Sources are
+/// path indices shifted by one so that entry from hand (-1) is class 0.
+/// Positions with fewer than two legal moves carry no decision and are skipped.
+fn dump_decisions(model: &Path, output: &Path, stride: usize, offset: usize) {
+    let lut = Lut::read(model);
+    let stride = stride.max(1);
+    let started = Instant::now();
+    let mut file = BufWriter::with_capacity(1 << 22, File::create(output).unwrap());
+    let mut moves = [0i8; 8];
+    let mut buffer = [0u8; 12];
+    let mut written = 0usize;
+    let mut global = 0usize;
+    for upper in 0..lut.maps.len() {
+        let count = lut.maps[upper].count;
+        let mut index = if global >= offset {
+            let behind = (global - offset) % stride;
+            if behind == 0 { 0 } else { stride - behind }
+        } else {
+            offset - global
+        };
+        while index < count {
+            let game = lut.encoding.decode(lut.key_at(upper, index));
+            if !game.finished {
+                for &roll in lut.rules.possible_rolls() {
+                    if roll == 0 {
+                        continue;
+                    }
+                    let mut position = game.clone();
+                    let legal = position.apply_roll(roll, &mut moves);
+                    if legal < 2 {
+                        continue;
+                    }
+                    let mut mask = 0u16;
+                    let mut best_class = 0u8;
+                    let mut best_value = f64::NEG_INFINITY;
+                    for &source in &moves[..legal] {
+                        let class = (source + 1) as u16;
+                        mask |= 1 << class;
+                        let mut next = position.clone();
+                        next.apply_move(source, lut.rules);
+                        // The mover is light in every stored state, so the
+                        // reflection is the only thing to get right here.
+                        let light = lut.light_win_percent(&next);
+                        let value = if position.is_light_turn { light } else { 100.0 - light };
+                        if value > best_value {
+                            best_value = value;
+                            best_class = class as u8;
+                        }
+                    }
+                    buffer[..8].copy_from_slice(&pack_position(&position).to_le_bytes());
+                    buffer[8] = roll;
+                    buffer[9..11].copy_from_slice(&mask.to_le_bytes());
+                    buffer[11] = best_class;
+                    file.write_all(&buffer).unwrap();
+                    written += 1;
+                }
+            }
+            index += stride;
+        }
+        global += count;
+    }
+    file.flush().unwrap();
+    eprintln!(
+        "wrote {written} decisions ({:.3} GB) to {} in {:.1}s",
+        written as f64 * 12.0 / 1e9,
+        output.display(),
+        started.elapsed().as_secs_f64()
+    );
+}
+
 /// Stage 2: the evaluation set, as sibling groups of candidate successors.
 ///
 /// This is what makes the capacity sweep framework-neutral. Rather than teach
@@ -4251,7 +4333,7 @@ fn regret_report(
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis simulate <model.rgu> <output-dir> <label> [compare-states] [games-per-state] [games-per-epsilon] [shard-seed]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>\n  royalur_analysis dump-tensors <model.rgu> <output.bin> [stride] [offset]\n  royalur_analysis dump-successors <model.rgu> <output.csv> [positions] [onpolicy|uniform] [seed]");
+    eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis simulate <model.rgu> <output-dir> <label> [compare-states] [games-per-state] [games-per-epsilon] [shard-seed]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>\n  royalur_analysis dump-tensors <model.rgu> <output.bin> [stride] [offset]\n  royalur_analysis dump-decisions <model.rgu> <output.bin> [stride] [offset]\n  royalur_analysis dump-successors <model.rgu> <output.csv> [positions] [onpolicy|uniform] [seed]");
     std::process::exit(2);
 }
 
@@ -4286,6 +4368,17 @@ fn main() {
         let offset = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0usize);
         assert!(offset < stride, "offset must be less than stride");
         dump_tensors(&model, &output, stride, offset);
+        return;
+    }
+    if command == "dump-decisions" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let stride = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1);
+        let offset = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0usize);
+        assert!(offset < stride, "offset must be less than stride");
+        dump_decisions(&model, &output, stride, offset);
         return;
     }
     if command == "dump-successors" {

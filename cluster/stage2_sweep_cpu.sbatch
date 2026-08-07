@@ -41,8 +41,10 @@ PYTHON=${UR_VENV:-$UR_ROOT/.venv}/bin/python
 echo "host=$(hostname) ruleset=$RULESET objective=$OBJECTIVE threads=$OMP_NUM_THREADS"
 
 EXTRA=()
-if [[ $OBJECTIVE != value ]]; then
+if [[ $OBJECTIVE == ordering ]]; then
     EXTRA=(--train-successors "$DATA/train.csv")
+elif [[ $OBJECTIVE == policy ]]; then
+    EXTRA=(--decisions "$DATA/decisions.bin")
 fi
 
 "$PYTHON" "$UR_ROOT/scripts/nn_sweep.py" "$RULESET" \

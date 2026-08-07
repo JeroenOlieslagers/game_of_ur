@@ -41,8 +41,10 @@ echo "host=$(hostname) ruleset=$RULESET objective=$OBJECTIVE"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 EXTRA=()
-if [[ $OBJECTIVE != value ]]; then
+if [[ $OBJECTIVE == ordering ]]; then
     EXTRA=(--train-successors "$DATA/train.csv")
+elif [[ $OBJECTIVE == policy ]]; then
+    EXTRA=(--decisions "$DATA/decisions.bin")
 fi
 
 "$PYTHON" "$UR_ROOT/scripts/nn_sweep.py" "$RULESET" \

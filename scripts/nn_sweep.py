@@ -58,7 +58,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from ur_tensors import PATHS, PIECES, Successors, load_tensors, usable_tiles  # noqa: E402
+from ur_tensors import (PATHS, PIECES, Successors, load_decisions,  # noqa: E402
+                        load_tensors, usable_tiles)
 
 MAX_ROLL = 8
 
@@ -248,11 +249,24 @@ def main() -> None:
     evaluation = Successors(eval_path, ruleset)
     print(f"eval set: {len(evaluation)} positions, {len(evaluation.packed)} successors")
 
-    packed_np, values_np = load_tensors(tensors_path)
-    packed = torch.from_numpy(packed_np.astype(np.int64)).to(device)
-    values = torch.from_numpy(values_np.astype(np.float32)).to(device)
+    # A policy head never looks at values, and the Masters table is 6 GB of
+    # device memory that would otherwise sit idle beside a 14 GB decision set.
+    needs_table = objective != "policy"
+    if needs_table:
+        packed_np, values_np = load_tensors(tensors_path)
+        packed = torch.from_numpy(packed_np.astype(np.int64)).to(device)
+        values = torch.from_numpy(values_np.astype(np.float32)).to(device)
+        state_count = len(packed_np)
+    else:
+        packed = values = None
+        state_count = len(np.memmap(tensors_path, dtype=np.uint8, mode="r")) // 12
+        train = holdout = None
+        print(f"table: {state_count} states (not loaded; policy head needs no values)",
+              flush=True)
 
-    if holdout_fraction > 0:
+    if not needs_table:
+        pass
+    elif holdout_fraction > 0:
         generator = torch.Generator(device="cpu").manual_seed(20250807)
         shuffled = torch.randperm(len(packed), generator=generator).to(device)
         cut = int(len(packed) * holdout_fraction)
@@ -264,33 +278,46 @@ def main() -> None:
         print(f"table: {len(packed)} states, all used for fitting", flush=True)
 
     groups = None
-    if objective in ("ordering", "policy"):
+    if objective == "policy":
+        # The whole decision space, not a sample of it. A policy trained on a
+        # sample compresses that sample; with on-policy sampling the evaluation
+        # positions are a subset of it, and the measurement becomes circular.
+        decisions_path = argument("--decisions")
+        if not decisions_path:
+            raise SystemExit("--decisions is required for the policy objective")
+        d_packed, d_roll, d_mask, d_best = load_decisions(decisions_path)
+        # The mask stays packed into an int32 and is expanded per batch. Held
+        # as a bool matrix it would be 1.2 billion decisions x 17 classes for
+        # Masters -- 20 GB to store what a shift and an AND recompute for free.
+        groups = {
+            "parent": torch.from_numpy(d_packed.astype(np.int64)).to(device),
+            "roll": torch.from_numpy(d_roll.astype(np.int8)).to(device),
+            "bits": torch.from_numpy(d_mask.astype(np.int32)).to(device),
+            "best": torch.from_numpy(d_best.astype(np.int8)).to(device),
+        }
+        print(f"policy training set: {len(d_packed)} decisions (the full space), "
+              f"{sum(v.element_size() * v.numel() for v in groups.values()) / 1e9:.1f} GB",
+              flush=True)
+    elif objective == "ordering":
         if not train_successors:
             raise SystemExit(f"--train-successors is required for the {objective} objective")
         training_set = Successors(train_successors, ruleset)
-        if objective == "ordering":
-            widest = int(training_set.counts.max())
-            slot = np.full((len(training_set), widest), -1, dtype=np.int64)
-            for row, (offset, count) in enumerate(zip(training_set.offsets, training_set.counts)):
-                slot[row, :count] = np.arange(offset, offset + count)
-            groups = {
-                "slot": torch.from_numpy(slot).to(device),
-                "mask": torch.from_numpy(slot >= 0).to(device),
-                "packed": torch.from_numpy(training_set.packed.astype(np.int64)).to(device),
-                "passed": torch.from_numpy(training_set.passed.astype(np.float32)).to(device),
-                "best": torch.from_numpy(
-                    np.argmax(np.where(slot >= 0, training_set.value[np.clip(slot, 0, None)], -1e9),
-                              axis=1)).to(device),
-            }
-        else:
-            mask, best_source, _ = training_set.policy_targets()
-            groups = {
-                "parent": torch.from_numpy(training_set.parent.astype(np.int64)).to(device),
-                "roll": torch.from_numpy(training_set.roll).to(device),
-                "mask": torch.from_numpy(mask).to(device),
-                "best": torch.from_numpy(best_source).to(device),
-            }
-        print(f"{objective} training set: {len(training_set)} positions", flush=True)
+        widest = int(training_set.counts.max())
+        slot = np.full((len(training_set), widest), -1, dtype=np.int64)
+        for row, (offset, count) in enumerate(zip(training_set.offsets, training_set.counts)):
+            slot[row, :count] = np.arange(offset, offset + count)
+        groups = {
+            "slot": torch.from_numpy(slot).to(device),
+            "mask": torch.from_numpy(slot >= 0).to(device),
+            "packed": torch.from_numpy(training_set.packed.astype(np.int64)).to(device),
+            "passed": torch.from_numpy(training_set.passed.astype(np.float32)).to(device),
+            "best": torch.from_numpy(
+                np.argmax(np.where(slot >= 0, training_set.value[np.clip(slot, 0, None)], -1e9),
+                          axis=1)).to(device),
+        }
+        print(f"ordering training set: {len(training_set)} positions "
+              f"-- NOTE: a sample, so its rate axis is not comparable to value/policy",
+              flush=True)
 
     classes = unpack.path_length + 1
     outputs = classes if objective == "policy" else 1
@@ -325,9 +352,11 @@ def main() -> None:
             else:
                 rows = torch.randint(0, len(groups["parent"]), (batch // 4,), device=device)
                 logits = run(model, unpack, groups["parent"][rows],
-                             extra=roll_onehot(groups["roll"][rows]))
-                logits = logits.masked_fill(~groups["mask"][rows], -1e9)
-                loss = torch.nn.functional.cross_entropy(logits, groups["best"][rows])
+                             extra=roll_onehot(groups["roll"][rows].long()))
+                legal = ((groups["bits"][rows].view(-1, 1).long()
+                          >> torch.arange(classes, device=device).view(1, -1)) & 1).bool()
+                logits = logits.masked_fill(~legal, -1e9)
+                loss = torch.nn.functional.cross_entropy(logits, groups["best"][rows].long())
 
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
@@ -346,7 +375,7 @@ def main() -> None:
         record = {
             "ruleset": ruleset, "arch": arch, "objective": objective, "size": spec,
             "width": width, "depth": depth, "parameters": parameters,
-            "bits": parameters * 32, "bits_per_state": parameters * 32 / len(packed_np),
+            "bits": parameters * 32, "bits_per_state": parameters * 32 / state_count,
             "steps": steps, "batch": batch, "holdout_fraction": holdout_fraction,
             "seconds": round(time.time() - started, 1),
             "fit_mae": fit_mae, "fit_max_error": fit_max,

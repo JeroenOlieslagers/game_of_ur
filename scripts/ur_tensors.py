@@ -96,6 +96,26 @@ def path_occupancy(packed: np.ndarray, ruleset: str) -> np.ndarray:
     return np.stack(columns, axis=1)
 
 
+def load_decisions(path: str, limit: int | None = None):
+    """Memory-map a `dump-decisions` file: every decision in the game.
+
+    Returns (packed position, roll, legal-source mask, optimal source class).
+    This is the policy analogue of the full table: training a policy head on a
+    sampled subset instead makes the rate axis meaningless, because the object
+    being compressed shrinks to something a mid-sized model can memorise.
+    """
+    raw = np.memmap(path, dtype=np.uint8, mode="r")
+    count = len(raw) // 12
+    if limit is not None:
+        count = min(count, limit)
+    view = raw[: 12 * count].reshape(count, 12)
+    packed = view[:, :8].copy().view(np.uint64).reshape(count)
+    roll = view[:, 8].copy().astype(np.int64)
+    mask = view[:, 9:11].copy().view(np.uint16).reshape(count)
+    best = view[:, 11].copy().astype(np.int64)
+    return packed, roll, mask, best
+
+
 def load_tensors(path: str, limit: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Memory-map a `dump-tensors` file as (packed words, values)."""
     raw = np.memmap(path, dtype=np.uint8, mode="r")

@@ -48,6 +48,17 @@ echo "=== evaluation sets (fast, and they gate the big dump) ==="
 "$BINARY" dump-successors "$MAP" "$OUT/eval_uniform.csv" 60000  uniform  0x1f7b3c9d20e45a16
 "$BINARY" dump-successors "$MAP" "$OUT/train.csv"        400000 onpolicy 0xa3e91f7c5b28d604
 
+echo "=== every decision in the game (policy training set) ==="
+# Stride 1 is the whole space. A policy fitted to a *sample* compresses that
+# sample, and since on-policy sampling revisits early-game states, a separately
+# drawn on-policy evaluation set turned out to be entirely contained in a 400k
+# training sample -- which made the measurement circular.
+if [[ -s $OUT/decisions.bin ]] && [[ -z ${UR_FORCE_TENSORS:-} ]]; then
+    echo "decisions.bin already present ($(stat -c%s "$OUT/decisions.bin") bytes); skipping"
+else
+    "$BINARY" dump-decisions "$MAP" "$OUT/decisions.bin" "${UR_DECISION_STRIDE:-1}" 0
+fi
+
 echo "=== full table ==="
 # The successor files change whenever the CSV schema does; the table dump only
 # changes when the packing does, and it is the expensive half. Skipping an
