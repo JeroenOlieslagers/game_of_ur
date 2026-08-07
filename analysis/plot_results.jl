@@ -153,11 +153,22 @@ end
 
 # The map is read only for its training-precision metadata, which annotates the
 # gap histogram; the figure data itself comes from the CSVs.
+# Candidate file names per rule set, tried in order. The map is opened only for
+# its training-precision metadata, so either our own solve or the published map
+# will do; whichever is present locally is used.
 const MODEL_FILES = Dict(
-    "blitz"   => "blitz_f64.rgu",
-    "masters" => "masters3d_f64.rgu",
-    "finkel"  => "finkel_f64_ours.rgu",
+    "blitz"   => ["blitz_f64.rgu"],
+    "masters" => ["masters3d_f64.rgu"],
+    "finkel"  => ["finkel_f64_ours.rgu", "finkel_f64.rgu"],
 )
+
+function find_model(ruleset)
+    for name in MODEL_FILES[ruleset]
+        path = joinpath(MODEL_DIR, name)
+        isfile(path) && return path
+    end
+    error("no map found for $ruleset; tried " * join(MODEL_FILES[ruleset], ", "))
+end
 # The inset magnifies the high-epsilon corner, where the optimal agent's win
 # rate approaches 100%; each rule set needs its own window.
 const INSET_LIMITS = Dict(
@@ -169,9 +180,9 @@ const INSET_LIMITS = Dict(
 const RULESETS = length(ARGS) >= 4 ? split(ARGS[4], ",") : ["blitz", "finkel", "masters"]
 
 for ruleset in RULESETS
-    model_name = MODEL_FILES[ruleset]
+    model_path = find_model(ruleset)
     inset_y_limits = INSET_LIMITS[ruleset]
-    precision = training_precision(joinpath(MODEL_DIR, model_name))
+    precision = training_precision(model_path)
     gap_figure, ties = fig1(joinpath(RESULTS_DIR, "$(ruleset)_gaps.csv"), precision)
     save(joinpath(FIGURE_DIR, "$(ruleset)_difference_hist.pdf"), gap_figure)
     save(joinpath(FIGURE_DIR, "$(ruleset)_simulation_compare.pdf"), fig2(joinpath(RESULTS_DIR, "$(ruleset)_compare.csv")))
