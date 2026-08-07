@@ -203,6 +203,12 @@ evaluators.
 
 ## Stage 2 — neural network compression of the lookup table
 
+**Planned in detail in `stage2-compression.md`.** The sketch below is what this
+document originally proposed; the plan document supersedes it, in particular by
+treating stage 1's linear models as the left-hand end of the same curve and by
+adding computable reference curves (bit-quantisation of the table, Lloyd-Max, and
+the policy-table floor) that any learned model must beat.
+
 Frame this as **rate-distortion**: parameters against error. The headline is a
 curve, not a single number.
 
