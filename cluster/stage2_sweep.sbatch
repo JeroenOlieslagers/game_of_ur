@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=ur_s2nn
 #SBATCH --account=torch_pr_362_general
-#SBATCH --partition=l40s,h100,h200,rtx8000
+#SBATCH --partition=l40s_public,h200_public
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
-#SBATCH --mem=96G
-#SBATCH --time=08:00:00
+#SBATCH --mem=64G
+#SBATCH --time=02:00:00
 #SBATCH --output=logs/s2nn_%x_%j.out
 #SBATCH --error=logs/s2nn_%x_%j.out
 
 # The capacity sweep for one rule set and one objective.
 #
-# A single GPU is deliberate. The models top out around 8M parameters and the
-# whole table sits in device memory, so this is bound by kernel launches rather
-# than by FLOPs -- a second GPU would buy nothing and would schedule far worse.
+# A single GPU on a short walltime is deliberate. The models top out around 8M
+# parameters and the whole table sits in device memory, so this is bound by
+# kernel launches rather than by FLOPs; a second GPU would buy nothing. The two
+# hour limit is about scheduling, not about need -- the sweep takes well under
+# an hour, and a short request backfills into gaps that an eight hour one will
+# sit behind for days on a low fairshare.
 #
 # Usage: sbatch stage2_sweep.sbatch <ruleset> <value|ordering>
 
 set -euo pipefail
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/env.sh"
+# Slurm copies the batch script into a spool directory, so BASH_SOURCE points
+# there rather than at the repository. UR_ROOT is exported at submission time
+# and is the only reliable way back to the tree.
+source "${UR_ROOT:?export UR_ROOT when submitting}/cluster/env.sh"
 
 RULESET=${1:?ruleset required}
 OBJECTIVE=${2:-value}

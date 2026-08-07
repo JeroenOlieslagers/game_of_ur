@@ -14,7 +14,10 @@
 # compute-node glibc (2.34) rather than the login-node glibc (2.39).
 
 set -euo pipefail
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/env.sh"
+# Slurm copies the batch script into a spool directory, so BASH_SOURCE points
+# there rather than at the repository. UR_ROOT is exported at submission time
+# and is the only reliable way back to the tree.
+source "${UR_ROOT:?export UR_ROOT when submitting}/cluster/env.sh"
 
 echo "host=$(hostname) glibc=$(ldd --version | head -1)"
 
@@ -24,7 +27,10 @@ if ! command -v cc >/dev/null 2>&1 && [[ ! -x ${CC:-/nonexistent} ]]; then
     # Dedicated prefix: never touch the working `env` environment.
     conda create -y -p "$UR_TOOLCHAIN" -c conda-forge \
         gcc_linux-64 sysroot_linux-64=2.17 binutils_linux-64
-    source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/env.sh"
+    # Slurm copies the batch script into a spool directory, so BASH_SOURCE points
+# there rather than at the repository. UR_ROOT is exported at submission time
+# and is the only reliable way back to the tree.
+source "${UR_ROOT:?export UR_ROOT when submitting}/cluster/env.sh"
 fi
 
 echo "CC=${CC:-cc}"

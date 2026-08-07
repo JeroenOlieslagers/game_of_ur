@@ -18,7 +18,10 @@
 # home directory.
 
 set -euo pipefail
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/env.sh"
+# Slurm copies the batch script into a spool directory, so BASH_SOURCE points
+# there rather than at the repository. UR_ROOT is exported at submission time
+# and is the only reliable way back to the tree.
+source "${UR_ROOT:?export UR_ROOT when submitting}/cluster/env.sh"
 
 export UR_VENV=${UR_VENV:-$UR_ROOT/.venv}
 export PIP_CACHE_DIR=$UR_ROOT/.pip-cache
