@@ -104,6 +104,17 @@ class Unpacker:
         other = ((packed >> 51) & 7).clamp(0, self.pieces)
         return mover, other
 
+    def check(self, packed: torch.Tensor) -> None:
+        """Reject occupancy code 3, which the packing never produces.
+
+        Worth an explicit check because it fails silently rather than loudly:
+        in the one-hot it writes into 3*slot+3, which is the *next* tile's
+        "empty" position, so a format drift would corrupt inputs instead of
+        raising. Run once at startup, not per batch.
+        """
+        codes = (packed.view(-1, 1) >> (2 * self.tiles).view(1, -1)) & 3
+        assert int(codes.max()) < 3, "occupancy code 3 present; packing format has drifted"
+
     def dense(self, packed: torch.Tensor) -> torch.Tensor:
         """One-hot over tiles and hands, for the dense architecture."""
         rows = packed.shape[0]
@@ -187,7 +198,58 @@ class PieceTransformer(torch.nn.Module):
         return self.head(pooled)
 
 
+class PointerHead(torch.nn.Module):
+    """A trunk that encodes the position once, scoring each candidate move.
+
+    This exists because the plain policy head and the value model each give up
+    something the other keeps. A value model scores successors, so it gets a
+    free ply of search -- it sees what each move leads to, using the known
+    dynamics -- but pays one forward pass per candidate. A policy head runs the
+    trunk once but sees only the parent and the roll, so it has to internalise
+    those dynamics, and it has nowhere to condition logit k on move k's own
+    features.
+
+    Here the trunk runs once and each candidate is scored by a small shared
+    function of (position embedding, that move's features). One trunk pass, and
+    move features are usable -- which stage 1 found were worth roughly as much
+    as the state features on their own.
+
+    Move features are supplied per class; illegal classes are masked out by the
+    caller, so their scores never matter.
+    """
+
+    def __init__(self, trunk: torch.nn.Module, width: int, classes: int,
+                 move_features: int):
+        super().__init__()
+        self.trunk = trunk
+        self.classes = classes
+        # A learned embedding per source class carries "which move is this",
+        # the way a positional embedding carries "which square is this".
+        self.move = torch.nn.Embedding(classes, width)
+        self.project = torch.nn.Linear(move_features, width) if move_features else None
+        self.score = torch.nn.Sequential(
+            torch.nn.Linear(2 * width, width), torch.nn.ReLU(),
+            torch.nn.Linear(width, 1))
+
+    def forward(self, dense, tokens, hands, extra=None, summary=None, moves=None):
+        context = self.trunk(dense, tokens, hands, extra=extra, summary=summary)
+        rows = context.shape[0]
+        candidates = self.move.weight.unsqueeze(0).expand(rows, -1, -1)
+        if self.project is not None and moves is not None:
+            candidates = candidates + self.project(moves)
+        context = context.unsqueeze(1).expand(-1, self.classes, -1)
+        return self.score(torch.cat([context, candidates], dim=2)).squeeze(2)
+
+
 def build(arch: str, width: int, depth: int, unpack: Unpacker, outputs: int, extra: int):
+    if arch == "pointer":
+        trunk = Dense(width, depth, unpack.width + extra, width)
+        return PointerHead(trunk, width, outputs, 0)
+    if arch == "pointer-transformer":
+        summary = 14 if unpack.features is not None else 0
+        trunk = PieceTransformer(width, depth, unpack.path_length, unpack.pieces,
+                                 width, extra + summary)
+        return PointerHead(trunk, width, outputs, 0)
     if arch == "mlp":
         return Dense(width, depth, unpack.width + extra, outputs)
     if arch == "transformer":
@@ -280,6 +342,7 @@ def main() -> None:
     use_features = argument("--features", "none") != "none"
     unpack = Unpacker(ruleset, device, features=use_features)
     evaluation = Successors(eval_path, ruleset)
+    unpack.check(torch.from_numpy(evaluation.packed[:4096].astype(np.int64)).to(device))
     print(f"eval set: {len(evaluation)} positions, {len(evaluation.packed)} successors")
 
     # A policy head never looks at values, and the Masters table is 6 GB of
