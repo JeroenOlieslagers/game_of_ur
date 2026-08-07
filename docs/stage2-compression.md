@@ -245,6 +245,128 @@ schedule far more easily than multi-GPU ones. The binding constraint is streamin
 
 Long jobs go on the cluster. Local runs get killed.
 
+## Results so far (blitz)
+
+Preliminary. The convergence control has not finished, so every number is "what
+this recipe reached", not "what this capacity can do" -- see the caveats at the
+end, which are load-bearing rather than decorative.
+
+### The reference curve
+
+Quantising the table itself, scored by policy regret on 60,000 on-policy
+decisions. The policy floor -- the cost of tabulating only the argmax -- is
+**1.433 bits per decision state**.
+
+| bits/state | uniform | Lloyd-Max |
+| --- | --- | --- |
+| 1 | 1.2141 | 0.6402 |
+| 4 | 0.5042 | 0.1741 |
+| 5 | 0.2173 | 0.1131 |
+| 6 | 0.0842 | 0.0633 |
+| 8 | 0.0076 | 0.0237 |
+| 12 | 0.0000 | 0.0018 |
+
+Lloyd-Max wins below about six bits and **loses above seven**. It minimises
+squared value error, so it spends code points where the density is and accepts a
+ten-point maximum error; uniform keeps every sibling gap resolvable. Another
+instance of value error and move ordering coming apart, now in a setting with no
+model in it at all.
+
+### The learned curve
+
+MLP, value objective, 60k steps on a GPU.
+
+| params | regret | equivalent table rate | ratio vs table |
+| --- | --- | --- | --- |
+| 3,425 | 0.0841 | ~6 bits/state | 2,260x |
+| 25,985 | 0.0282 | ~7 bits/state | 347x |
+| 563,201 | 0.0049 | ~8.5 bits/state | 20x |
+
+**The advantage collapses by two orders of magnitude across the curve.** At low
+rate a network exploits structure the table does not encode, and that structure
+is worth enormous amounts; at high rate there is little left to find and it
+competes with raw storage on storage's terms. Where the learned and quantisation
+curves meet is the honest measure of how much of the game is *compressible*
+rather than merely tabulated.
+
+Stage 1's linear models still hold the extreme low end: 667 parameters reach
+0.1052, against 0.0841 for a 3,425-parameter network. Better in absolute terms,
+worse per parameter by about five times -- engineered features remain the right
+choice at a budget of a few hundred weights.
+
+### Value head against policy head
+
+Both at 60k steps, the policy head trained on all 158,968,482 decisions.
+
+| params | value | params | policy |
+| --- | --- | --- | --- |
+| 3,425 | **0.0841** | 4,209 | 0.1158 |
+| 25,985 | **0.0282** | 29,073 | 0.0450 |
+| 563,201 | **0.0049** | 575,505 | 0.0111 |
+| 2,174,977 | 0.0090 (unstable) | 2,199,569 | 0.0058 |
+| — | — | 8,593,425 | **0.0029** |
+
+**The value head wins at every matched capacity and the gap widens with size**
+(27% to 56%). The reason is that scoring successors is not merely a cost of one
+forward pass per candidate -- it is a free ply of search, using dynamics the
+model does not have to learn. A policy head sees only the position and the roll
+and must internalise those dynamics. The advantage compounds as the evaluator
+becomes accurate enough to exploit it.
+
+A second effect runs the other way: **the policy head trains stably where the
+value head does not.** Its curve is monotone to 8.6M parameters while the value
+head regressed at 2.2M and timed out above that. Cross-entropy over a discrete
+class appears better conditioned at scale than BCE against a continuous target,
+so at the top of the sweep the comparison is confounded by trainability rather
+than by information.
+
+### Engineered features do not wash out
+
+Stage 1's 14 state features concatenated to the input, same recipe both arms:
+
+| params | without | with | change |
+| --- | --- | --- | --- |
+| ~9k | 0.0790 | 0.0609 | -23% |
+| ~85k | 0.0279 | 0.0241 | -14% |
+| ~565k | 0.0134 | 0.0112 | -16% |
+
+The benefit persists at half a million parameters, which is the interesting
+outcome. The likely reason is `exposure` and `threat`: they are
+`sum_r P(r) * 1[capture available with roll r]`, a lookahead over the dice
+distribution rather than a function of current occupancy, so recovering them
+means learning to simulate a roll. They were also top of the stage-1
+Shapley-over-regret ranking.
+
+### How much of this is noise
+
+Two runs differing only in seed:
+
+| params | run A | run B | spread |
+| --- | --- | --- | --- |
+| 3,425 | 0.1413 | 0.1087 | 26% |
+| 25,985 | 0.0437 | 0.0461 | 5% |
+| 563,201 | 0.0129 | 0.0134 | 4% |
+
+Small models are far more sensitive to initialisation. Any difference under
+about 25% at a few thousand parameters, or under 5% at half a million, is not a
+result. This retired one comparison that had already been drawn.
+
+### Caveats
+
+- **Not converged.** The same 3,425-parameter model scored 0.1413 at 12k steps
+  and 0.0841 at 60k. Every point is an upper bound on distortion, and the
+  looseness may vary with capacity, which distorts the *shape* rather than
+  merely shifting the curve.
+- **The value head above 563k parameters is unreliable** -- 2.2M came out worse
+  than 563k, which means undertraining rather than a capacity limit.
+- **The ordering objective is not comparable.** It is trained on a sampled set
+  rather than the full space, so its rate axis measures a different object. Its
+  regret falls to zero while its value error *rises* to 21.8 points, which is the
+  signature of memorising a ranking.
+- **The pointer head result is uninformative.** It was built without the
+  per-move features that were its entire justification, so it adds parameters
+  without information and loses accordingly.
+
 ## Order of work
 
 1. `dump-tensors` and `dump-successors`, verified with the reflection check.
