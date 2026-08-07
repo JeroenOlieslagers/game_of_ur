@@ -1,0 +1,9 @@
+# The seven-rule decision list selected in stage 1, in priority order.
+# Regret 0.319 pp held out, against 0.398 for a list of hand-written predicates.
+capture_value + 3 * lands_rosette - 5 * delta_exposure
+(delta_threat > 0.2 or captures) and exposure_self < 0.35
+not leaves_centre and delta_exposure <= 0
+4 * enters + 3 * lands_rosette - 5 * exposure_self
+(lands_centre or delta_exposure_value < -4)
+delta_threat > 0.35
+delta_exposure > 0 and delta_threat > 0.2

@@ -3249,6 +3249,426 @@ impl MovePolicy {
 /// Sides alternate, so a policy that played perfectly would sit at exactly 50%.
 /// This is the ground truth that regret only approximates: it includes error
 /// compounding and the fact that a weaker agent visits different positions.
+/// A boolean rule over move features, in the small language of `rule_dsl.py`.
+///
+/// Ported to Rust so a decision list can actually *play*, which stage 1 could
+/// not measure: its rule lists had exact regret but no win rate, and regret
+/// converts to a win-rate deficit at 62x to 130x depending on the rule set, so
+/// a regret figure alone does not settle how strong a strategy is.
+///
+/// The grammar matches the Python one exactly -- or / and / not / comparison /
+/// sum / product / atom -- and a bare arithmetic expression is true when
+/// positive. Text is parsed, never evaluated, so generated rules are safe.
+enum Rule {
+    Number(f64),
+    Feature(usize),
+    Negate(Box<Rule>),
+    Not(Box<Rule>),
+    Binary(RuleOp, Box<Rule>, Box<Rule>),
+}
+
+#[derive(Clone, Copy)]
+enum RuleOp {
+    Add, Sub, Mul, Div,
+    Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual,
+    And, Or,
+}
+
+struct RuleParser {
+    tokens: Vec<String>,
+    position: usize,
+    names: Vec<String>,
+}
+
+impl RuleParser {
+    fn tokenize(text: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let bytes: Vec<char> = text.chars().collect();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            let character = bytes[index];
+            if character.is_whitespace() {
+                index += 1;
+            } else if character.is_ascii_alphabetic() || character == '_' {
+                let start = index;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == '_')
+                {
+                    index += 1;
+                }
+                tokens.push(bytes[start..index].iter().collect());
+            } else if character.is_ascii_digit() || character == '.' {
+                let start = index;
+                while index < bytes.len() && (bytes[index].is_ascii_digit() || bytes[index] == '.') {
+                    index += 1;
+                }
+                tokens.push(bytes[start..index].iter().collect());
+            } else {
+                // Two-character comparisons must be tried before one-character ones.
+                let two: String = bytes[index..(index + 2).min(bytes.len())].iter().collect();
+                if matches!(two.as_str(), "<=" | ">=" | "==" | "!=") {
+                    tokens.push(two);
+                    index += 2;
+                } else {
+                    tokens.push(character.to_string());
+                    index += 1;
+                }
+            }
+        }
+        tokens
+    }
+
+    fn peek(&self) -> Option<&str> {
+        self.tokens.get(self.position).map(String::as_str)
+    }
+
+    fn take(&mut self) -> String {
+        let token = self.tokens[self.position].clone();
+        self.position += 1;
+        token
+    }
+
+    fn parse(text: &str, names: Vec<String>) -> Rule {
+        let mut parser = RuleParser { tokens: Self::tokenize(text), position: 0, names };
+        let rule = parser.or_expr();
+        assert!(
+            parser.position == parser.tokens.len(),
+            "trailing tokens in rule: {text}"
+        );
+        rule
+    }
+
+    fn or_expr(&mut self) -> Rule {
+        let mut left = self.and_expr();
+        while self.peek() == Some("or") {
+            self.take();
+            left = Rule::Binary(RuleOp::Or, Box::new(left), Box::new(self.and_expr()));
+        }
+        left
+    }
+
+    fn and_expr(&mut self) -> Rule {
+        let mut left = self.not_expr();
+        while self.peek() == Some("and") {
+            self.take();
+            left = Rule::Binary(RuleOp::And, Box::new(left), Box::new(self.not_expr()));
+        }
+        left
+    }
+
+    fn not_expr(&mut self) -> Rule {
+        if self.peek() == Some("not") {
+            self.take();
+            return Rule::Not(Box::new(self.not_expr()));
+        }
+        self.comparison()
+    }
+
+    fn comparison(&mut self) -> Rule {
+        let left = self.sum();
+        let operator = match self.peek() {
+            Some("<") => RuleOp::Less,
+            Some("<=") => RuleOp::LessEqual,
+            Some(">") => RuleOp::Greater,
+            Some(">=") => RuleOp::GreaterEqual,
+            Some("==") => RuleOp::Equal,
+            Some("!=") => RuleOp::NotEqual,
+            _ => return left,
+        };
+        self.take();
+        Rule::Binary(operator, Box::new(left), Box::new(self.sum()))
+    }
+
+    fn sum(&mut self) -> Rule {
+        let mut left = self.product();
+        loop {
+            let operator = match self.peek() {
+                Some("+") => RuleOp::Add,
+                Some("-") => RuleOp::Sub,
+                _ => return left,
+            };
+            self.take();
+            left = Rule::Binary(operator, Box::new(left), Box::new(self.product()));
+        }
+    }
+
+    fn product(&mut self) -> Rule {
+        let mut left = self.atom();
+        loop {
+            let operator = match self.peek() {
+                Some("*") => RuleOp::Mul,
+                Some("/") => RuleOp::Div,
+                _ => return left,
+            };
+            self.take();
+            left = Rule::Binary(operator, Box::new(left), Box::new(self.atom()));
+        }
+    }
+
+    fn atom(&mut self) -> Rule {
+        match self.peek() {
+            Some("(") => {
+                self.take();
+                let inner = self.or_expr();
+                assert_eq!(self.take(), ")", "unbalanced parenthesis in rule");
+                inner
+            }
+            Some("-") => {
+                self.take();
+                Rule::Negate(Box::new(self.atom()))
+            }
+            Some(token) => {
+                let token = token.to_string();
+                self.take();
+                if let Ok(number) = token.parse::<f64>() {
+                    return Rule::Number(number);
+                }
+                let index = self
+                    .names
+                    .iter()
+                    .position(|name| *name == token)
+                    .unwrap_or_else(|| panic!("unknown feature in rule: {token}"));
+                Rule::Feature(index)
+            }
+            None => panic!("unexpected end of rule"),
+        }
+    }
+}
+
+impl Rule {
+    fn evaluate(&self, row: &[f64]) -> f64 {
+        match self {
+            Rule::Number(value) => *value,
+            Rule::Feature(index) => row[*index],
+            Rule::Negate(inner) => -inner.evaluate(row),
+            Rule::Not(inner) => f64::from(!(inner.evaluate(row) > 0.0)),
+            Rule::Binary(operator, left, right) => {
+                let a = left.evaluate(row);
+                let b = right.evaluate(row);
+                match operator {
+                    RuleOp::Add => a + b,
+                    RuleOp::Sub => a - b,
+                    RuleOp::Mul => a * b,
+                    RuleOp::Div => {
+                        if b == 0.0 { 0.0 } else { a / b }
+                    }
+                    RuleOp::Less => f64::from(a < b),
+                    RuleOp::LessEqual => f64::from(a <= b),
+                    RuleOp::Greater => f64::from(a > b),
+                    RuleOp::GreaterEqual => f64::from(a >= b),
+                    RuleOp::Equal => f64::from(a == b),
+                    RuleOp::NotEqual => f64::from(a != b),
+                    RuleOp::And => f64::from(a > 0.0 && b > 0.0),
+                    RuleOp::Or => f64::from(a > 0.0 || b > 0.0),
+                }
+            }
+        }
+    }
+
+    fn holds(&self, row: &[f64]) -> bool {
+        self.evaluate(row) > 0.0
+    }
+}
+
+/// The 36 feature names a rule may refer to, state block first.
+fn rule_feature_names() -> Vec<String> {
+    FEATURE_NAMES
+        .iter()
+        .chain(MOVE_FEATURE_NAMES.iter())
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// A priority list of rules, applied as a filter over the candidate moves.
+///
+/// Each rule narrows the surviving set, but only if it would leave something
+/// alive -- a rule that eliminates every candidate is skipped for that
+/// position. The first survivor in engine move order is played, which is what
+/// makes the list a complete policy rather than a preference.
+struct DecisionList {
+    rules: Vec<(String, Rule)>,
+}
+
+impl DecisionList {
+    fn load(path: &Path) -> Self {
+        let names = rule_feature_names();
+        let text = fs::read_to_string(path).expect("failed to read rules");
+        let rules = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| (line.to_string(), RuleParser::parse(line, names.clone())))
+            .collect();
+        Self { rules }
+    }
+
+    fn choose(&self, lut: &Lut, game: &Game, roll: usize, moves: &[i8]) -> i8 {
+        let mut rows = Vec::with_capacity(moves.len());
+        for &source in moves {
+            let mut next = game.clone();
+            next.apply_move(source, lut.rules);
+            let mut row = if next.finished {
+                vec![0.0; FEATURE_COUNT]
+            } else {
+                features(lut, &next).to_vec()
+            };
+            row.extend_from_slice(&move_features(lut, game, source, roll, &next));
+            rows.push(row);
+        }
+        let mut alive: Vec<bool> = vec![true; moves.len()];
+        for (_, rule) in &self.rules {
+            let candidate: Vec<bool> = alive
+                .iter()
+                .zip(&rows)
+                .map(|(&live, row)| live && rule.holds(row))
+                .collect();
+            if candidate.iter().any(|&live| live) {
+                alive = candidate;
+            }
+        }
+        let index = alive.iter().position(|&live| live).unwrap_or(0);
+        moves[index]
+    }
+}
+
+/// Evaluate a rule list against a `dump-move-features` CSV and report, per
+/// rule, how many rows it holds on -- plus the decision list's regret.
+///
+/// This exists to be diffed against the Python evaluator on the same file. The
+/// two grammars are written twice, in different languages, and a divergence
+/// would show up as a wrong win rate rather than as an error, so agreement is
+/// checked rather than assumed.
+fn check_rules(rules_path: &Path, csv_path: &Path) {
+    let names = rule_feature_names();
+    let text = fs::read_to_string(rules_path).expect("failed to read rules");
+    let rules: Vec<(String, Rule)> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| (line.to_string(), RuleParser::parse(line, names.clone())))
+        .collect();
+
+    let data = fs::read_to_string(csv_path).expect("failed to read move features");
+    let mut lines = data.lines();
+    let header: Vec<&str> = lines.next().expect("empty csv").split(',').collect();
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|field| *field == name)
+            .unwrap_or_else(|| panic!("missing column {name}"))
+    };
+    let feature_columns: Vec<usize> = names.iter().map(|name| column(name)).collect();
+    let state_column = column("state");
+    let value_column = column("value_mover");
+
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    let mut states: Vec<usize> = Vec::new();
+    let mut values: Vec<f64> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        rows.push(feature_columns.iter().map(|&i| fields[i].parse().unwrap()).collect());
+        states.push(fields[state_column].parse().unwrap());
+        values.push(fields[value_column].parse().unwrap());
+    }
+
+    println!("{} rows, {} rules", rows.len(), rules.len());
+    for (text, rule) in &rules {
+        let held = rows.iter().filter(|row| rule.holds(row)).count();
+        println!("  holds={held:>8}   {text}");
+    }
+
+    // Group rows by position and apply the list exactly as the engine does.
+    let mut total = 0.0;
+    let mut positions = 0usize;
+    let mut start = 0usize;
+    while start < rows.len() {
+        let mut end = start;
+        while end < rows.len() && states[end] == states[start] {
+            end += 1;
+        }
+        let group = &rows[start..end];
+        let mut alive: Vec<bool> = vec![true; group.len()];
+        for (_, rule) in &rules {
+            let candidate: Vec<bool> = alive
+                .iter()
+                .zip(group)
+                .map(|(&live, row)| live && rule.holds(row))
+                .collect();
+            if candidate.iter().any(|&live| live) {
+                alive = candidate;
+            }
+        }
+        let picked = alive.iter().position(|&live| live).unwrap_or(0);
+        let best = values[start..end].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        total += best - values[start + picked];
+        positions += 1;
+        start = end;
+    }
+    println!("positions={positions} mean_regret={:.6}", total / positions as f64);
+}
+
+/// Win rate for a decision list against the optimal agent.
+fn rules_winrate(model: &Path, rules_path: &Path, games: usize, seed: u64) {
+    let lut = Lut::read(model);
+    let list = DecisionList::load(rules_path);
+    eprintln!("loaded {} rules:", list.rules.len());
+    for (index, (text, _)) in list.rules.iter().enumerate() {
+        eprintln!("  {}. {text}", index + 1);
+    }
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let per_thread = (games + threads - 1) / threads;
+    let started = Instant::now();
+
+    let wins: usize = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for thread_index in 0..threads {
+            let count = per_thread.min(games.saturating_sub(thread_index * per_thread));
+            let lut = &lut;
+            let list = &list;
+            handles.push(scope.spawn(move || {
+                let mut rng =
+                    SplitMix64::new(seed ^ (thread_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                let mut moves = [0i8; 8];
+                let mut wins = 0usize;
+                for game_index in 0..count {
+                    let rules_are_light = (thread_index + game_index) % 2 == 0;
+                    let mut game = Game::initial(lut.rules);
+                    let mut plies = 0usize;
+                    while !game.finished {
+                        plies += 1;
+                        assert!(plies < 100_000, "game failed to terminate");
+                        let roll = lut.rules.roll(&mut rng) as usize;
+                        let available = game.apply_roll(roll as u8, &mut moves);
+                        if available == 0 {
+                            continue;
+                        }
+                        let source = if game.is_light_turn == rules_are_light {
+                            list.choose(lut, &game, roll, &moves[..available])
+                        } else {
+                            choose_optimal_move(lut, &game, &moves[..available])
+                        };
+                        game.apply_move(source, lut.rules);
+                    }
+                    if (game.light_score >= lut.rules.pieces()) == rules_are_light {
+                        wins += 1;
+                    }
+                }
+                wins
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+
+    let percent = 100.0 * wins as f64 / games as f64;
+    let error = 100.0 * (0.25 / games as f64).sqrt();
+    println!("games={games} wins={wins}");
+    println!("win_pct={percent:.4} standard_error={error:.4}");
+    println!("seconds={:.1}", started.elapsed().as_secs_f64());
+}
+
 fn policy_winrate(model: &Path, weights: &Path, games: usize, seed: u64) {
     let lut = Lut::read(model);
     let policy = MovePolicy::load(weights);
@@ -4412,6 +4832,23 @@ fn main() {
         let on_policy = !matches!(args.get(5).map(String::as_str), Some("uniform"));
         let seed = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0x5c1d_47a2_9fb3_0e68);
         dump_successors(&model, &output, samples, on_policy, seed);
+        return;
+    }
+    if command == "check-rules" {
+        if args.len() < 4 {
+            usage();
+        }
+        // model is args[2] = the rules file here.
+        check_rules(&model, Path::new(&args[3]));
+        return;
+    }
+    if command == "winrate-rules" {
+        if args.len() < 4 {
+            usage();
+        }
+        let games = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(100_000);
+        let seed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x4d2b_8f31_ce07_a95b);
+        rules_winrate(&model, Path::new(&args[3]), games, seed);
         return;
     }
     if command == "winrate" {
