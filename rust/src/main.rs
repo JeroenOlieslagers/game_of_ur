@@ -2810,12 +2810,56 @@ fn feature_gram(model: &Path, output: &Path) {
     );
 }
 
-const MOVE_FEATURE_COUNT: usize = 12;
+const MOVE_FEATURE_COUNT: usize = 16;
 const MOVE_FEATURE_NAMES: [&str; MOVE_FEATURE_COUNT] = [
     "advance", "captures", "scores", "enters", "lands_rosette", "lands_centre",
     "leaves_centre", "dest_safe", "src_was_exposed", "delta_exposure",
     "delta_threat", "keeps_turn",
+    // Magnitudes, not just occurrence. Error analysis showed the binary
+    // versions cannot distinguish taking a piece one square from home from
+    // taking one that just entered, and capture decisions carry by far the most
+    // regret.
+    "capture_value", "rescue_value", "delta_exposure_value", "delta_threat_value",
 ];
+
+/// Expected progress captured on the next turn, assuming the capturing player
+/// takes the most advanced piece available to them.
+///
+/// This is the magnitude behind `capture_probability`: a 1-in-4 chance of taking
+/// a piece 13 squares along is worth far more than the same chance at a piece
+/// that has just entered.
+fn weighted_capture_value(lut: &Lut, game: &Game, for_mover: bool) -> f64 {
+    let mut probe = game.clone();
+    if !for_mover {
+        probe.is_light_turn = !probe.is_light_turn;
+    }
+    probe.roll = -1;
+    let sign = probe.turn_sign();
+    let path = if probe.is_light_turn { lut.rules.light_path() } else { lut.rules.dark_path() };
+
+    let mut total = 0.0;
+    let mut moves = [0i8; 8];
+    for (roll, &probability) in lut.rules.roll_probabilities().iter().enumerate() {
+        if probability == 0.0 {
+            continue;
+        }
+        let mut rolled = probe.clone();
+        let count = rolled.apply_roll(roll as u8, &mut moves);
+        let mut best = 0.0f64;
+        for &source in &moves[..count] {
+            let destination = source as isize + roll as isize;
+            if destination < 0 || destination as usize >= path.len() {
+                continue;
+            }
+            let occupant = rolled.board[path[destination as usize]];
+            if occupant != 0 && occupant * sign < 0 {
+                best = best.max(occupant.abs() as f64);
+            }
+        }
+        total += probability * best;
+    }
+    total
+}
 
 /// Features of the *move* rather than of the resulting position.
 ///
@@ -2852,13 +2896,25 @@ fn move_features(
     // turn it now is.
     let exposure_before = capture_probability(lut, rolled, false);
     let threat_before = capture_probability(lut, rolled, true);
-    let (exposure_after, threat_after) = if next.finished {
-        (0.0, 0.0)
+    let exposure_value_before = weighted_capture_value(lut, rolled, false);
+    let threat_value_before = weighted_capture_value(lut, rolled, true);
+    let (exposure_after, threat_after, exposure_value_after, threat_value_after) = if next.finished {
+        (0.0, 0.0, 0.0, 0.0)
     } else {
         (
             capture_probability(lut, next, turn_passed),
             capture_probability(lut, next, !turn_passed),
+            weighted_capture_value(lut, next, turn_passed),
+            weighted_capture_value(lut, next, !turn_passed),
         )
+    };
+
+    // How advanced was the piece taken, and the piece rescued.
+    let capture_value = if captures { rolled.board[destination].abs() as f64 } else { 0.0 };
+    let rescue_value = if source >= 0 && source_was_exposed_check(lut, rolled, path[source as usize]) {
+        (source as f64) + 1.0
+    } else {
+        0.0
     };
 
     let source_tile = if source >= 0 { Some(path[source as usize]) } else { None };
@@ -2879,7 +2935,18 @@ fn move_features(
         exposure_after - exposure_before,
         threat_after - threat_before,
         f64::from(!turn_passed),
+        capture_value,
+        rescue_value,
+        exposure_value_after - exposure_value_before,
+        threat_value_after - threat_value_before,
     ]
+}
+
+/// Whether a tile is one the opponent can actually reach and take.
+fn source_was_exposed_check(lut: &Lut, game: &Game, tile: usize) -> bool {
+    let opponent_path = if game.is_light_turn { lut.rules.dark_path() } else { lut.rules.light_path() };
+    opponent_path.contains(&tile)
+        && !(lut.rules.safe_rosettes() && ROSETTES.contains(&tile))
 }
 
 /// Dump every candidate move with BOTH state features and move features, plus
