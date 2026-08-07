@@ -60,6 +60,7 @@ import torch
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from ur_tensors import (PATHS, PIECES, Successors, load_decisions,  # noqa: E402
                         load_tensors, usable_tiles)
+from ur_features import StateFeatures  # noqa: E402
 
 MAX_ROLL = 8
 
@@ -77,7 +78,7 @@ class Unpacker:
     entire table in device memory.
     """
 
-    def __init__(self, ruleset: str, device: torch.device):
+    def __init__(self, ruleset: str, device: torch.device, features: bool = False):
         self.ruleset = ruleset
         self.device = device
         self.tiles = torch.tensor(usable_tiles(ruleset), device=device)
@@ -86,6 +87,17 @@ class Unpacker:
         self.path_length = len(light)
         self.paths = torch.tensor(list(light) + list(dark), device=device)
         self.width = 3 * len(self.tiles) + 2 * (self.pieces + 1)
+        # Stage 1's 14 state features, recomputed per batch rather than stored.
+        # Scaled to roughly unit range so they do not dominate the one-hot block.
+        self.features = StateFeatures(ruleset, device) if features else None
+        if self.features is not None:
+            self.width += 14
+            self.scale = torch.tensor(
+                [self.path_length * self.pieces, self.path_length * self.pieces,
+                 self.pieces, self.pieces, self.pieces, self.pieces,
+                 self.pieces, self.pieces, 1.0, 1.0, 1.0, 1.0,
+                 self.path_length, self.path_length],
+                device=device, dtype=torch.float32)
 
     def hands(self, packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mover = ((packed >> 48) & 7).clamp(0, self.pieces)
@@ -104,6 +116,8 @@ class Unpacker:
         mover, other = self.hands(packed)
         out.scatter_(1, base + mover.view(-1, 1), 1.0)
         out.scatter_(1, base + hand_width + other.view(-1, 1), 1.0)
+        if self.features is not None:
+            out[:, -14:] = self.features(packed) / self.scale
         return out
 
     def tokens(self, packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -129,7 +143,8 @@ class Dense(torch.nn.Module):
         layers.append(torch.nn.Linear(previous, outputs))
         self.stack = torch.nn.Sequential(*layers)
 
-    def forward(self, dense, tokens, hands, extra=None):
+    def forward(self, dense, tokens, hands, extra=None, summary=None):
+        # `summary` is already inside `dense` for this architecture.
         if extra is not None:
             dense = torch.cat([dense, extra], dim=1)
         return self.stack(dense)
@@ -160,14 +175,15 @@ class PieceTransformer(torch.nn.Module):
         self.encoder = torch.nn.TransformerEncoder(layer, depth)
         self.head = torch.nn.Linear(width + extra, outputs)
 
-    def forward(self, dense, tokens, hands, extra=None):
+    def forward(self, dense, tokens, hands, extra=None, summary=None):
         board = self.occupancy(tokens)
         hand = self.hand(hands)
         sequence = torch.cat([board, hand], dim=1)
         sequence = sequence + self.position.weight.unsqueeze(0)
         pooled = self.encoder(sequence).mean(dim=1)
-        if extra is not None:
-            pooled = torch.cat([pooled, extra], dim=1)
+        for block in (extra, summary):
+            if block is not None:
+                pooled = torch.cat([pooled, block], dim=1)
         return self.head(pooled)
 
 
@@ -175,13 +191,25 @@ def build(arch: str, width: int, depth: int, unpack: Unpacker, outputs: int, ext
     if arch == "mlp":
         return Dense(width, depth, unpack.width + extra, outputs)
     if arch == "transformer":
+        # The engineered block is a summary of the whole position, so it joins
+        # after pooling rather than as another token.
+        summary = 14 if unpack.features is not None else 0
         return PieceTransformer(width, depth, unpack.path_length, unpack.pieces,
-                                outputs, extra)
+                                outputs, extra + summary)
     raise SystemExit(f"unknown architecture: {arch}")
 
 
 def run(model, unpack, packed, extra=None):
-    return model(unpack.dense(packed), *unpack.tokens(packed), extra=extra)
+    """Feed a batch through whichever architecture is in use.
+
+    The dense stack reads the engineered features straight out of its input
+    vector; the transformer never sees that vector, so the same block is handed
+    to it separately as a pooled summary. Passing it to both would count it
+    twice and mismatch the input width.
+    """
+    dense = unpack.dense(packed)
+    summary = dense[:, -14:] if unpack.features is not None else None
+    return model(dense, *unpack.tokens(packed), extra=extra, summary=summary)
 
 
 @torch.no_grad()
@@ -246,9 +274,11 @@ def main() -> None:
     train_successors = argument("--train-successors")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device} ruleset={ruleset} arch={arch} objective={objective}", flush=True)
+    print(f"device={device} ruleset={ruleset} arch={arch} objective={objective} "
+          f"features={argument('--features', 'none')}", flush=True)
 
-    unpack = Unpacker(ruleset, device)
+    use_features = argument("--features", "none") != "none"
+    unpack = Unpacker(ruleset, device, features=use_features)
     evaluation = Successors(eval_path, ruleset)
     print(f"eval set: {len(evaluation)} positions, {len(evaluation.packed)} successors")
 
@@ -393,6 +423,7 @@ def main() -> None:
             "bits": parameters * 32, "bits_per_state": parameters * 32 / state_count,
             "steps": steps, "batch": batch, "holdout_fraction": holdout_fraction,
             "lr": learning_rate, "loss": loss_kind, "tag": tag,
+            "features": argument("--features", "none"),
             "seconds": round(time.time() - started, 1),
             "fit_mae": fit_mae, "fit_max_error": fit_max,
             "holdout_mae": hold_mae, "holdout_max_error": hold_max,

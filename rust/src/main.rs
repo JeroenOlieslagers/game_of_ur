@@ -4119,9 +4119,13 @@ fn dump_successors(model: &Path, output: &Path, samples: usize, on_policy: bool,
     let lut = Lut::read(model);
     let mut rng = SplitMix64::new(seed);
     let mut file = BufWriter::new(File::create(output).unwrap());
+    // The 14 state features go out beside the packed word so the GPU-side
+    // reimplementation in `ur_features.py` can be checked against this one
+    // rather than assumed to agree with it.
     writeln!(
         file,
-        "position,move,passed,terminal,value_mover,packed,parent,roll,source"
+        "position,move,passed,terminal,value_mover,packed,parent,roll,source,{}",
+        FEATURE_NAMES.join(",")
     )
     .unwrap();
 
@@ -4170,12 +4174,18 @@ fn dump_successors(model: &Path, output: &Path, samples: usize, on_policy: bool,
             // `source` is an index into the mover's own path, with -1 meaning
             // entry from hand. Path indices are unchanged by the reflection
             // that canonicalises the board, so this needs no adjustment.
+            let feature_row: Vec<String> = if next.finished {
+                vec!["0".into(); FEATURE_COUNT]
+            } else {
+                features(&lut, &next).iter().map(|v| format!("{v:.9}")).collect()
+            };
             writeln!(
                 file,
-                "{positions},{index},{},{},{value:.9},{},{parent},{roll},{source}",
+                "{positions},{index},{},{},{value:.9},{},{parent},{roll},{source},{}",
                 u8::from(passed),
                 u8::from(next.finished),
-                pack_position(&next)
+                pack_position(&next),
+                feature_row.join(",")
             )
             .unwrap();
             rows += 1;
