@@ -3889,6 +3889,199 @@ fn stage_curve(model: &Path, output: &Path, games_per_stage: usize, seed: u64) {
     output_file.flush().unwrap();
 }
 
+/// Pack a position into the layout the stage-2 models consume.
+///
+/// The position is first put in **canonical orientation**: if it is dark to
+/// move it is reflected so that the player to move is always light. Occupancy
+/// then reads 0 empty, 1 the player to move, 2 the other player, and board
+/// index `t` means the same square of the mover's own geometry in every record.
+/// Without this the same tactical position would occupy two different points in
+/// input space depending on colour, and a model would have to spend capacity
+/// learning a symmetry the encoding can simply be given.
+///
+/// Stored table states are already light-to-move, so they pass through
+/// untouched; the canonicalisation earns its keep on successors, where the mover
+/// may be either colour.
+///
+/// Bits 0..47 are the 24 board slots at two bits each, bits 48..53 the two hands
+/// and bits 54..61 the two scores, mover first in both.
+fn pack_position(game: &Game) -> u64 {
+    let canonical;
+    let view = if game.is_light_turn {
+        game
+    } else {
+        canonical = game.reverse_players();
+        &canonical
+    };
+    let mut packed = 0u64;
+    for tile in 0..BOARD_LEN {
+        let piece = view.board[tile];
+        let code = if piece == 0 {
+            0u64
+        } else if piece > 0 {
+            1
+        } else {
+            2
+        };
+        packed |= code << (2 * tile);
+    }
+    packed |= (view.light_pieces as u64) << 48;
+    packed |= (view.dark_pieces as u64) << 51;
+    packed |= (view.light_score as u64) << 54;
+    packed |= (view.dark_score as u64) << 58;
+    packed
+}
+
+/// Assert the packing is genuinely colour-blind before writing gigabytes of it.
+///
+/// A position and its reflection describe the same decision from the two sides,
+/// so they must pack identically, and their exact values must sum to 100 rather
+/// than negate. Both halves of that sentence were mis-implemented at some point
+/// in stage 1, which is why this runs as a gate rather than living in a comment.
+fn check_packing_symmetry(lut: &Lut, samples: usize) {
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+    let mut checked = 0usize;
+    while checked < samples {
+        let (key, value) = lut.key_value_at_global(rng.index(lut.total));
+        let game = lut.encoding.decode(key);
+        if game.finished {
+            continue;
+        }
+        let mirrored = game.reverse_players();
+        assert_eq!(
+            pack_position(&game),
+            pack_position(&mirrored),
+            "packing is not invariant under reflection"
+        );
+        let mirrored_value = 100.0 - lut.light_win_percent(&mirrored);
+        assert!(
+            (value - mirrored_value).abs() < 1e-6,
+            "value {value} and reflected value {mirrored_value} disagree"
+        );
+        checked += 1;
+    }
+    eprintln!("packing symmetry verified on {checked} states");
+}
+
+/// Stage 2: stream the whole table as (packed position, value) for training.
+///
+/// Twelve bytes per record, little-endian: `u64` packed position then `f32` win
+/// percentage for the player to move. Masters is 501M records, or 6 GB, which
+/// mmaps comfortably; `stride`/`offset` shard the walk so a Slurm array can
+/// write disjoint pieces (task `i` of `n` passes stride `n`, offset `i`).
+fn dump_tensors(model: &Path, output: &Path, stride: usize, offset: usize) {
+    let lut = Lut::read(model);
+    let stride = stride.max(1);
+    check_packing_symmetry(&lut, 10_000);
+    let started = Instant::now();
+    let mut file = BufWriter::with_capacity(1 << 22, File::create(output).unwrap());
+    let mut written = 0usize;
+    let mut global = 0usize;
+    let mut buffer = [0u8; 12];
+    for upper in 0..lut.maps.len() {
+        let count = lut.maps[upper].count;
+        // First index in this map that is congruent to `offset` modulo stride.
+        let mut index = if global >= offset {
+            let behind = (global - offset) % stride;
+            if behind == 0 { 0 } else { stride - behind }
+        } else {
+            offset - global
+        };
+        while index < count {
+            let game = lut.encoding.decode(lut.key_at(upper, index));
+            let value = lut.value_at(upper, index) as f32;
+            buffer[..8].copy_from_slice(&pack_position(&game).to_le_bytes());
+            buffer[8..].copy_from_slice(&value.to_le_bytes());
+            file.write_all(&buffer).unwrap();
+            written += 1;
+            index += stride;
+        }
+        global += count;
+    }
+    file.flush().unwrap();
+    eprintln!(
+        "wrote {written} records ({:.3} GB) to {} in {:.1}s",
+        written as f64 * 12.0 / 1e9,
+        output.display(),
+        started.elapsed().as_secs_f64()
+    );
+}
+
+/// Stage 2: the evaluation set, as sibling groups of candidate successors.
+///
+/// This is what makes the capacity sweep framework-neutral. Rather than teach
+/// the engine to run every model family, the engine writes out each candidate
+/// successor of a sampled position; whatever scores those successors -- a net, a
+/// boosted ensemble, a quantised table -- takes the argmax and gets regret
+/// without ever entering Rust.
+///
+/// `value_mover` is the exact value from the perspective of the player who is
+/// choosing, while `packed` is written from the perspective of whoever moves in
+/// the successor. Those differ exactly when the move passes the turn, which is
+/// what `passed` records: a model scoring `packed` returns the successor mover's
+/// value, so the chooser's value is `100 - score` when `passed` is 1. Getting
+/// this backwards was the single most expensive bug in stage 1.
+fn dump_successors(model: &Path, output: &Path, samples: usize, on_policy: bool, seed: u64) {
+    let lut = Lut::read(model);
+    let mut rng = SplitMix64::new(seed);
+    let mut file = BufWriter::new(File::create(output).unwrap());
+    writeln!(file, "position,move,passed,terminal,value_mover,packed").unwrap();
+
+    let mut moves = [0i8; 8];
+    let mut game = Game::initial(lut.rules);
+    let mut positions = 0usize;
+    let mut rows = 0usize;
+    while positions < samples {
+        if !on_policy {
+            // Uniform over stored states: draw a key, decode, and roll on it.
+            let (key, _) = lut.key_value_at_global(rng.index(lut.total));
+            game = lut.encoding.decode(key);
+            if game.finished {
+                continue;
+            }
+        } else if game.finished {
+            game = Game::initial(lut.rules);
+        }
+        let roll = lut.rules.roll(&mut rng);
+        let count = game.apply_roll(roll, &mut moves);
+        if count == 0 {
+            continue;
+        }
+        let snapshot = game.clone();
+        if on_policy {
+            let chosen = choose_optimal_move(&lut, &game, &moves[..count]);
+            game.apply_move(chosen, lut.rules);
+        }
+        // A position with one legal move carries no decision and no regret.
+        if count < 2 {
+            continue;
+        }
+        let mover_is_light = snapshot.is_light_turn;
+        for (index, &source) in moves[..count].iter().enumerate() {
+            let mut next = snapshot.clone();
+            next.apply_move(source, lut.rules);
+            let passed = next.is_light_turn != mover_is_light;
+            let light = lut.light_win_percent(&next);
+            let value = if mover_is_light { light } else { 100.0 - light };
+            writeln!(
+                file,
+                "{positions},{index},{},{},{value:.9},{}",
+                u8::from(passed),
+                u8::from(next.finished),
+                pack_position(&next)
+            )
+            .unwrap();
+            rows += 1;
+        }
+        positions += 1;
+    }
+    file.flush().unwrap();
+    eprintln!(
+        "wrote {positions} positions, {rows} successors to {}",
+        output.display()
+    );
+}
+
 /// Stage 1: exact move regret for each heuristic, with no simulation.
 ///
 /// For a sampled state, regret is the win-probability the mover gives up by
@@ -4045,7 +4238,7 @@ fn regret_report(
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis simulate <model.rgu> <output-dir> <label> [compare-states] [games-per-state] [games-per-epsilon] [shard-seed]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>");
+    eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis simulate <model.rgu> <output-dir> <label> [compare-states] [games-per-state] [games-per-epsilon] [shard-seed]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>\n  royalur_analysis dump-tensors <model.rgu> <output.bin> [stride] [offset]\n  royalur_analysis dump-successors <model.rgu> <output.csv> [positions] [onpolicy|uniform] [seed]");
     std::process::exit(2);
 }
 
@@ -4069,6 +4262,28 @@ fn main() {
         let samples = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50_000);
         let seed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x6b2f_9e11_c40d_7a35);
         dump_move_features(&model, &output, samples, seed);
+        return;
+    }
+    if command == "dump-tensors" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let stride = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1);
+        let offset = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0usize);
+        assert!(offset < stride, "offset must be less than stride");
+        dump_tensors(&model, &output, stride, offset);
+        return;
+    }
+    if command == "dump-successors" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let samples = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(60_000);
+        let on_policy = !matches!(args.get(5).map(String::as_str), Some("uniform"));
+        let seed = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0x5c1d_47a2_9fb3_0e68);
+        dump_successors(&model, &output, samples, on_policy, seed);
         return;
     }
     if command == "winrate" {
