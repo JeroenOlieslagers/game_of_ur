@@ -92,6 +92,31 @@ expressed in squares of advancement:
   square
 - an available capture: +7; being exposed to capture: -1.4
 
+## 5a. Correction: an offset bug inflated every Python-side regret number
+
+The ordering fit moves a constant to the target side: it estimates
+`V - 100 * passed`, where `passed` marks a move that hands the turn over. That
+constant has to be added back before sibling moves are compared, because
+`passed` **differs between the candidate moves of one position** -- a move onto a
+rosette keeps the turn while others pass it. Omitting it penalised every
+turn-passing move by 100 points, so the policy grabbed rosettes.
+
+The symptom was visible and I misread it: the chooser took a turn-keeping move
+33.8% of the time against the optimal move's 24.4%. I wrote that up as "the
+model over-values rosettes", treating my own bug as a finding about the model,
+and used it to motivate new features.
+
+| Model | as first reported | corrected |
+| --- | --- | --- |
+| additive, 30 features | 0.2642 pp | **0.2225 pp** |
+| with pairwise interactions | 0.1944 pp | **0.1230 pp** |
+| turn-keeping picks | 0.338 | 0.252 (optimal 0.244) |
+
+Every regret number produced by the Python harness was inflated; the numbers
+from the Rust `regret` and `regret-all` commands were always correct, since they
+reflect through `100 - value` exactly as the table does. Fitted weights were also
+correct -- only the evaluation was wrong.
+
 ## 5. The fitted linear model is the strongest heuristic
 
 Mean move regret in win-probability points, 200,000 on-policy states per rule

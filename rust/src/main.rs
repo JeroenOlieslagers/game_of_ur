@@ -2810,7 +2810,7 @@ fn feature_gram(model: &Path, output: &Path) {
     );
 }
 
-const MOVE_FEATURE_COUNT: usize = 16;
+const MOVE_FEATURE_COUNT: usize = 22;
 const MOVE_FEATURE_NAMES: [&str; MOVE_FEATURE_COUNT] = [
     "advance", "captures", "scores", "enters", "lands_rosette", "lands_centre",
     "leaves_centre", "dest_safe", "src_was_exposed", "delta_exposure",
@@ -2820,6 +2820,11 @@ const MOVE_FEATURE_NAMES: [&str; MOVE_FEATURE_COUNT] = [
     // taking one that just entered, and capture decisions carry by far the most
     // regret.
     "capture_value", "rescue_value", "delta_exposure_value", "delta_threat_value",
+    // Structural facts about *which* piece, which no aggregate can express: two
+    // positions with identical totals differ in whether the capturable piece is
+    // the advanced one.
+    "captures_frontmost", "capture_gap_to_front", "moves_frontmost",
+    "becomes_safe_forever", "contact_possible", "threat_count",
 ];
 
 /// Expected progress captured on the next turn, assuming the capturing player
@@ -2911,6 +2916,104 @@ fn move_features(
 
     // How advanced was the piece taken, and the piece rescued.
     let capture_value = if captures { rolled.board[destination].abs() as f64 } else { 0.0 };
+
+    // How advanced is each side's leading piece, before the move.
+    let mut frontmost_own = 0i8;
+    let mut frontmost_enemy = 0i8;
+    for tile in 0..BOARD_LEN {
+        let piece = rolled.board[tile];
+        if piece == 0 {
+            continue;
+        }
+        if piece * sign > 0 {
+            frontmost_own = frontmost_own.max(piece.abs());
+        } else {
+            frontmost_enemy = frontmost_enemy.max(piece.abs());
+        }
+    }
+    let captures_frontmost = captures && rolled.board[destination].abs() == frontmost_enemy;
+    // Zero when the piece taken *is* their leader; larger the further back it was.
+    let capture_gap_to_front = if captures {
+        (frontmost_enemy - rolled.board[destination].abs()) as f64
+    } else {
+        0.0
+    };
+    let moves_frontmost = source >= 0 && (source + 1) == frontmost_own;
+
+    // Can the destination ever be captured again? Only if some enemy piece is
+    // still behind it on their path, or one can still enter and get there.
+    let enemy_hand = if mover_is_light { rolled.dark_pieces } else { rolled.light_pieces };
+    let becomes_safe_forever = if scores {
+        true
+    } else if destination_safe {
+        true
+    } else {
+        let reachable_by_enemy = |tile: usize| {
+            let Some(their_index) = opponent_path.iter().position(|&t| t == tile) else {
+                return false;
+            };
+            if enemy_hand > 0 {
+                return true;
+            }
+            // An enemy piece behind this tile on their own path can still arrive.
+            opponent_path[..their_index].iter().any(|&behind| {
+                let piece = rolled.board[behind];
+                piece != 0 && piece * sign < 0
+            })
+        };
+        !reachable_by_enemy(destination)
+    };
+
+    // Is any capture, by either side, still possible at all? Once both sets of
+    // pieces have passed each other the game is a pure race.
+    let contact_possible = {
+        let mut possible = false;
+        for tile in 0..BOARD_LEN {
+            if !opponent_path.contains(&tile) || !path.contains(&tile) {
+                continue;
+            }
+            let occupant = next.board[tile];
+            if occupant != 0 {
+                possible = true;
+                break;
+            }
+        }
+        possible || enemy_hand > 0
+    };
+
+    // How many distinct enemy pieces could be taken on the next turn.
+    let threat_count = if next.finished {
+        0.0
+    } else {
+        let mut probe = next.clone();
+        if turn_passed {
+            probe.is_light_turn = !probe.is_light_turn;
+        }
+        probe.roll = -1;
+        let probe_sign = probe.turn_sign();
+        let probe_path = if probe.is_light_turn { lut.rules.light_path() } else { lut.rules.dark_path() };
+        let mut seen = [false; BOARD_LEN];
+        let mut probe_moves = [0i8; 8];
+        for (roll, &probability) in lut.rules.roll_probabilities().iter().enumerate() {
+            if probability == 0.0 {
+                continue;
+            }
+            let mut rolled_probe = probe.clone();
+            let count = rolled_probe.apply_roll(roll as u8, &mut probe_moves);
+            for &source in &probe_moves[..count] {
+                let target = source as isize + roll as isize;
+                if target < 0 || target as usize >= probe_path.len() {
+                    continue;
+                }
+                let tile = probe_path[target as usize];
+                let occupant = rolled_probe.board[tile];
+                if occupant != 0 && occupant * probe_sign < 0 {
+                    seen[tile] = true;
+                }
+            }
+        }
+        seen.iter().filter(|&&hit| hit).count() as f64
+    };
     let rescue_value = if source >= 0 && source_was_exposed_check(lut, rolled, path[source as usize]) {
         (source as f64) + 1.0
     } else {
@@ -2939,6 +3042,12 @@ fn move_features(
         rescue_value,
         exposure_value_after - exposure_value_before,
         threat_value_after - threat_value_before,
+        f64::from(captures_frontmost),
+        capture_gap_to_front,
+        f64::from(moves_frontmost),
+        f64::from(becomes_safe_forever),
+        f64::from(contact_possible),
+        threat_count,
     ]
 }
 
@@ -3037,6 +3146,122 @@ fn dump_move_features(model: &Path, output: &Path, samples: usize, seed: u64) {
     }
     file.flush().unwrap();
     eprintln!("wrote {positions} positions to {}", output.display());
+}
+
+/// Exact mean regret over **every** decision in the map.
+///
+/// Sampling is unnecessary for evaluation: each decision's regret is exact, so
+/// one streaming pass gives the population mean with no Monte Carlo error and no
+/// choice of sampling distribution to defend.
+///
+/// Two averages are reported, and they answer different questions. The
+/// roll-weighted one treats a decision arising from a 1-in-16 roll as less
+/// important than one from a 6-in-16 roll, which is the right weighting for a
+/// state drawn uniformly. The unweighted one counts every decision once. Neither
+/// is the on-policy average: states are weighted by their presence in the map,
+/// not by how often play actually reaches them, which is why game-level win rate
+/// remains the ground truth for strength.
+fn regret_all(model: &Path, weights_path: &Path, stride: usize) {
+    let lut = Lut::read(model);
+    let text = fs::read_to_string(weights_path).expect("failed to read weights");
+    let values: Vec<f64> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.parse::<f64>().expect("weights must be one float per line"))
+        .collect();
+    assert_eq!(values.len(), WEIGHT_COUNT, "expected {WEIGHT_COUNT} weights");
+    let mut weights = [0.0; WEIGHT_COUNT];
+    weights.copy_from_slice(&values);
+
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let chunk = (lut.total + threads - 1) / threads;
+    let started = Instant::now();
+
+    let totals: Vec<(f64, f64, f64, usize, usize)> = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for thread_index in 0..threads {
+            let begin = thread_index * chunk;
+            let end = (begin + chunk).min(lut.total);
+            let lut = &lut;
+            let weights = &weights;
+            handles.push(scope.spawn(move || {
+                let mut rng = SplitMix64::new(0x1234_5678);
+                let mut moves = [0i8; 8];
+                let mut weighted_regret = 0.0;
+                let mut plain_regret = 0.0;
+                let mut weight_total = 0.0;
+                let mut decisions = 0usize;
+                let mut agreements = 0usize;
+                let mut global = begin;
+                while global < end {
+                    let (key, _) = lut.key_value_at_global(global);
+                    global += stride;
+                    let base = lut.encoding.decode(key);
+                    if base.finished {
+                        continue;
+                    }
+                    for (roll, &probability) in lut.rules.roll_probabilities().iter().enumerate() {
+                        if probability == 0.0 {
+                            continue;
+                        }
+                        let mut rolled = base.clone();
+                        let count = rolled.apply_roll(roll as u8, &mut moves);
+                        if count < 2 {
+                            continue;
+                        }
+                        let light_turn = rolled.is_light_turn;
+                        let mut picked = moves[0];
+                        let mut best_score = if light_turn { f64::NEG_INFINITY } else { f64::INFINITY };
+                        let mut best_value = f64::NEG_INFINITY;
+                        let mut picked_value = 0.0;
+                        for &source in &moves[..count] {
+                            let mut next = rolled.clone();
+                            next.apply_move(source, lut.rules);
+                            let light = lut.light_win_percent(&next);
+                            let mover_value = if light_turn { light } else { 100.0 - light };
+                            if mover_value > best_value {
+                                best_value = mover_value;
+                            }
+                            let score = heuristic_light_value(Some(weights), lut, &next, &mut rng);
+                            let better = if light_turn { score > best_score } else { score < best_score };
+                            if better {
+                                best_score = score;
+                                picked = source;
+                                picked_value = mover_value;
+                            }
+                        }
+                        let _ = picked;
+                        let regret = (best_value - picked_value).max(0.0);
+                        weighted_regret += probability * regret;
+                        weight_total += probability;
+                        plain_regret += regret;
+                        decisions += 1;
+                        if regret == 0.0 {
+                            agreements += 1;
+                        }
+                    }
+                }
+                (weighted_regret, plain_regret, weight_total, decisions, agreements)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let (mut weighted, mut plain, mut weight_total, mut decisions, mut agreements) =
+        (0.0, 0.0, 0.0, 0usize, 0usize);
+    for (a, b, c, d, e) in totals {
+        weighted += a;
+        plain += b;
+        weight_total += c;
+        decisions += d;
+        agreements += e;
+    }
+    println!("decisions={decisions} (stride {stride})");
+    println!("mean_regret_roll_weighted={:.6}", weighted / weight_total);
+    println!("mean_regret_unweighted={:.6}", plain / decisions as f64);
+    println!("move_agreement_pct={:.4}", 100.0 * agreements as f64 / decisions as f64);
+    println!("seconds={:.1}", started.elapsed().as_secs_f64());
 }
 
 /// Expectimax over dice, with a heuristic at the leaves.
@@ -3688,6 +3913,14 @@ fn main() {
         let samples = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50_000);
         let seed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x6b2f_9e11_c40d_7a35);
         dump_move_features(&model, &output, samples, seed);
+        return;
+    }
+    if command == "regret-all" {
+        if args.len() < 4 {
+            usage();
+        }
+        let stride = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1);
+        regret_all(&model, Path::new(&args[3]), stride);
         return;
     }
     if command == "depth-regret" {

@@ -51,6 +51,7 @@ class Positions:
         self.best = np.maximum.reduceat(values, offsets)
 
     def chosen(self, score):
+        # `score` here is already the comparable mover value.
         group_max = np.repeat(np.maximum.reduceat(score, self.offsets), self.counts)
         hits = np.flatnonzero(score >= group_max)
         owner = np.searchsorted(self.offsets, hits, side="right") - 1
@@ -58,7 +59,13 @@ class Positions:
         return hits[first]
 
     def regret(self, score):
-        return float(np.mean(self.best - self.values[self.chosen(score)]))
+        # `score` estimates the mover's value MINUS 100 for a move that passes
+        # the turn, because that constant was moved to the target side when
+        # fitting. It must be added back before comparing siblings: `passed`
+        # differs between the candidate moves of one position, so leaving it out
+        # penalises every turn-passing move by 100 and makes the policy grab
+        # rosettes.
+        return float(np.mean(self.best - self.values[self.chosen(score + 100 * self.passed)]))
 
     def centre(self, matrix):
         mean = np.add.reduceat(matrix, self.offsets, axis=0) / self.counts[:, None]

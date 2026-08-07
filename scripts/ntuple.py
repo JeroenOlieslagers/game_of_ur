@@ -42,13 +42,16 @@ def load(path):
 
 
 class Positions:
-    def __init__(self, values, offsets):
-        self.values, self.offsets = values, offsets
+    def __init__(self, values, offsets, passed):
+        self.values, self.offsets, self.passed = values, offsets, passed
         self.counts = np.diff(np.r_[offsets, len(values)])
         self.best = np.maximum.reduceat(values, offsets)
         self._owner = None
 
     def regret(self, score):
+        # See scripts/policy_families.py: the 100 * passed offset must be added
+        # back before sibling moves are comparable.
+        score = score + 100 * self.passed
         group_max = np.repeat(np.maximum.reduceat(score, self.offsets), self.counts)
         hits = np.flatnonzero(score >= group_max)
         owner = np.searchsorted(self.offsets, hits, side="right") - 1
@@ -120,7 +123,7 @@ def main() -> None:
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
     names, features, values, passed, occupancy, offsets = load(sys.argv[1])
-    positions = Positions(values, offsets)
+    positions = Positions(values, offsets, passed)
     target = values - 100 * passed
     sign = 1 - 2 * passed
     path_len = occupancy.shape[1]

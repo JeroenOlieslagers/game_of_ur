@@ -40,7 +40,9 @@ def main() -> None:
     target = values - 100 * passed
 
     def regret(weights):
-        score = design @ weights
+        # Add back the 100 * passed constant that the fit moved to the target
+        # side; it differs between sibling moves, so it cannot be dropped.
+        score = design @ weights + 100 * passed
         group_max = np.repeat(np.maximum.reduceat(score, offsets), counts)
         hits = np.flatnonzero(score >= group_max)
         owner = np.searchsorted(offsets, hits, side="right") - 1
