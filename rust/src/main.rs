@@ -3898,6 +3898,148 @@ fn expectimax_light(
 /// Depth 1 is the greedy policy used everywhere else: evaluate each successor
 /// with the heuristic. Deeper searches average over the opponent's roll and
 /// reply before evaluating, so a weak evaluator can compensate with lookahead.
+/// Move features at the root, a position evaluator at the leaves.
+///
+/// Depth applies only to position evaluators: a move-based model scores a
+/// *transition*, and at depth greater than one the leaves are positions, about
+/// which it has nothing to say. So the two model families have been measured on
+/// different axes and never combined. This is the combination.
+///
+/// The scoring rule is
+///
+///     score(move) = searched_value(successor, depth - 1) + lambda * w . move_features
+///
+/// with `lambda = 0` recovering pure search. A one-parameter family is used
+/// rather than a joint refit because the move-feature model already predicts
+/// value in win-probability points, so adding its output to a searched value
+/// double-counts the level; `lambda` is exactly the knob that says how much of
+/// the move term to trust on top of what search already knows.
+///
+/// The move weights are the move block of a fitted `policy_additive.txt`
+/// (14 state weights, then 22 move weights, then an intercept).
+fn hybrid_regret(
+    model: &Path,
+    output: &Path,
+    policy_path: &Path,
+    state_weights_path: &Path,
+    samples: usize,
+    max_depth: usize,
+    seed: u64,
+) {
+    let lut = Lut::read(model);
+    let read_floats = |path: &Path| -> Vec<f64> {
+        fs::read_to_string(path)
+            .expect("failed to read weights")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.parse::<f64>().expect("weights must be one float per line"))
+            .collect()
+    };
+    let policy = read_floats(policy_path);
+    assert_eq!(
+        policy.len(),
+        FEATURE_COUNT + MOVE_FEATURE_COUNT + 1,
+        "expected an additive policy: {FEATURE_COUNT} state + {MOVE_FEATURE_COUNT} move + intercept"
+    );
+    let mut move_weights = [0.0f64; MOVE_FEATURE_COUNT];
+    move_weights.copy_from_slice(&policy[FEATURE_COUNT..FEATURE_COUNT + MOVE_FEATURE_COUNT]);
+
+    let state_values = read_floats(state_weights_path);
+    assert_eq!(state_values.len(), WEIGHT_COUNT, "expected {WEIGHT_COUNT} state weights");
+    let mut state_weights = [0.0f64; WEIGHT_COUNT];
+    state_weights.copy_from_slice(&state_values);
+
+    // Decision states from optimal play, matching depth_regret's sampling.
+    let mut rng = SplitMix64::new(seed);
+    let mut states = Vec::with_capacity(samples);
+    let mut moves = [0i8; 8];
+    let mut game = Game::initial(lut.rules);
+    while states.len() < samples {
+        if game.finished {
+            game = Game::initial(lut.rules);
+        }
+        let roll = lut.rules.roll(&mut rng);
+        let count = game.apply_roll(roll, &mut moves);
+        if count == 0 {
+            continue;
+        }
+        if count > 1 {
+            states.push(game.clone());
+        }
+        let source = choose_optimal_move(&lut, &game, &moves[..count]);
+        game.apply_move(source, lut.rules);
+    }
+
+    let mut file = BufWriter::new(File::create(output).unwrap());
+    writeln!(file, "lambda,depth,states,mean_regret,agreement_pct,seconds").unwrap();
+    for &lambda in &[0.0, 0.25, 0.5, 1.0, 2.0] {
+        for depth in 1..=max_depth {
+            let started = Instant::now();
+            let mut total = 0.0;
+            let mut agreed = 0usize;
+            for position in &states {
+                let mut local = [0i8; 8];
+                let count = position.available_moves(&mut local);
+                let roll = position.roll as usize;
+                let mover_is_light = position.is_light_turn;
+                let mut best_score = f64::NEG_INFINITY;
+                let mut chosen = local[0];
+                let mut best_true = f64::NEG_INFINITY;
+                let mut search_rng = SplitMix64::new(0x51ed_270b_44c9_0af3);
+                for &source in &local[..count] {
+                    let mut next = position.clone();
+                    next.apply_move(source, lut.rules);
+                    let light = expectimax_light(
+                        Some(&state_weights), &lut, &next, depth - 1, &mut search_rng);
+                    let searched = if mover_is_light { light } else { 100.0 - light };
+                    let features = move_features(&lut, position, source, roll, &next);
+                    let move_term: f64 = features
+                        .iter()
+                        .zip(move_weights.iter())
+                        .map(|(f, w)| f * w)
+                        .sum();
+                    let score = searched + lambda * move_term;
+                    if score > best_score {
+                        best_score = score;
+                        chosen = source;
+                    }
+                    let true_light = lut.light_win_percent(&next);
+                    let true_value = if mover_is_light { true_light } else { 100.0 - true_light };
+                    if true_value > best_true {
+                        best_true = true_value;
+                    }
+                }
+                // Recomputed after the loop: `chosen` can change after a
+                // candidate's value has already been passed over.
+                let mut next = position.clone();
+                next.apply_move(chosen, lut.rules);
+                let light = lut.light_win_percent(&next);
+                let chosen_true = if mover_is_light { light } else { 100.0 - light };
+                let regret = best_true - chosen_true;
+                total += regret;
+                if regret < 1e-9 {
+                    agreed += 1;
+                }
+            }
+            let mean = total / states.len() as f64;
+            let agreement = 100.0 * agreed as f64 / states.len() as f64;
+            let seconds = started.elapsed().as_secs_f64();
+            writeln!(
+                file,
+                "{lambda},{depth},{},{mean:.6},{agreement:.4},{seconds:.2}",
+                states.len()
+            )
+            .unwrap();
+            println!(
+                "lambda={lambda:<5} depth={depth}: mean_regret={mean:.4} \
+                 agreement={agreement:.2}% ({seconds:.1}s)"
+            );
+        }
+    }
+    file.flush().unwrap();
+}
+
 fn depth_regret(
     model: &Path,
     output: &Path,
@@ -4866,6 +5008,19 @@ fn main() {
         }
         let stride = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1);
         regret_all(&model, Path::new(&args[3]), stride);
+        return;
+    }
+    if command == "hybrid-regret" {
+        if args.len() < 6 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let policy = PathBuf::from(&args[4]);
+        let state_weights = PathBuf::from(&args[5]);
+        let samples = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(5_000);
+        let max_depth = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(3);
+        let seed = args.get(8).and_then(|s| s.parse().ok()).unwrap_or(0x51ed_270b_44c9_0af3);
+        hybrid_regret(&model, &output, &policy, &state_weights, samples, max_depth, seed);
         return;
     }
     if command == "depth-regret" {
