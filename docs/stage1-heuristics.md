@@ -256,6 +256,35 @@ buy; the case for depth is when parameters, not time, are the scarce resource.
 Lookahead also substitutes for evaluator quality: `advancement` at depth 2 beats
 `composite` at depth 1 on every rule set.
 
+### Move features at the root do not help a searching agent
+
+Move-based policies are root-only and position evaluators get the depth axis, so
+the two were never combined. The combination scores a move as
+
+```
+searched_value(successor, depth - 1) + lambda * w . move_features
+```
+
+with `lambda = 0` recovering pure search. Finkel, 5,000 on-policy positions:
+
+| lambda | depth 1 | depth 2 | depth 3 | depth 4 |
+| --- | --- | --- | --- | --- |
+| **0** | 0.2603 | **0.2316** | **0.1865** | **0.1394** |
+| 0.25 | 0.2574 | 0.2546 | 0.2351 | 0.1883 |
+| 0.5 | **0.2505** | 0.2538 | 0.2290 | 0.1974 |
+| 1 | 0.2557 | 0.2614 | 0.2331 | 0.2039 |
+| 2 | 0.2734 | 0.2782 | 0.2524 | 0.2314 |
+
+Move features help a depth-1 evaluator by about 4% and **harm a searching one**,
+monotonically in both lambda and depth -- at depth 4, even lambda = 0.25 is 35%
+worse than pure search.
+
+They are a cheap proxy for what search computes directly. `delta_exposure`
+estimates whether a move exposes a piece; a two-ply search evaluates exactly
+that, properly weighted by the dice. Once search is available the proxy is not
+merely redundant but biased, double-counting effects already accounted for, and
+it distorts the ordering. The hybrid is not worth building.
+
 ## Model complexity: a frontier, not a criterion
 
 Information criteria do not fit here. BIC penalises a likelihood, and our loss is
@@ -430,9 +459,10 @@ closer to optimal, but nothing here measures it.
   continues (Finkel `advancement` 0.4047 -> 0.3324). Each ply costs about 13.5x
   the last, so depth 8 needs the search rewritten with move ordering and pruning
   rather than a bigger allocation.
-- **A hybrid** of move features at the root over a position evaluator at the
-  leaves. Currently move-based policies are root-only and position evaluators get
-  the depth axis; the combination is untested and is the obvious best-of-both.
+- **Blocking and per-piece geometry** remain the one real gap in the feature
+  set. Adding them changes the feature count, which invalidates every fitted
+  weight file, so it is a deliberate re-run of the roster, frontier, Shapley and
+  win-rate jobs rather than an increment.
 
 ## Reproducing
 
