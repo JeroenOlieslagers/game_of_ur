@@ -12,14 +12,41 @@ export UR_LOGS=${UR_LOGS:-$UR_ROOT/logs}
 # Keep cargo and rustup off a quota-limited home directory: cargo creates a lot
 # of small files. On NYU Torch these belong under /scratch, which is where the
 # repository itself should live.
+#
+# The default is derived from UR_ROOT, but a toolchain installed for an earlier
+# layout will not be under a *new* UR_ROOT -- so prefer any existing install
+# over a path that merely follows the naming convention. Getting this wrong
+# fails as `cargo: command not found` a minute into a job, after every
+# downstream job has already queued behind it.
+for candidate in "${CARGO_HOME:-}" "$UR_ROOT/.cargo" /scratch/"$USER"/rust/cargo "$HOME/.cargo"; do
+    if [[ -n $candidate && -x $candidate/bin/cargo ]]; then
+        export CARGO_HOME=$candidate
+        break
+    fi
+done
 export CARGO_HOME=${CARGO_HOME:-$UR_ROOT/.cargo}
-export RUSTUP_HOME=${RUSTUP_HOME:-$UR_ROOT/.rustup}
+if [[ -z ${RUSTUP_HOME:-} ]]; then
+    default_rustup=${CARGO_HOME%/cargo}/rustup
+    if [[ -d $default_rustup ]]; then
+        export RUSTUP_HOME=$default_rustup
+    else
+        export RUSTUP_HOME=$UR_ROOT/.rustup
+    fi
+fi
 export PATH=$CARGO_HOME/bin:$PATH
 
 # Conda-provided C toolchain, used only to link the Rust binary. Two things make
 # it necessary on NYU Torch: login nodes have no C compiler at all, and login
 # nodes run glibc 2.39 while compute nodes run 2.34. The binary is therefore
 # built on a compute node against a sysroot old enough to run on either.
+# Same reasoning as CARGO_HOME above: an existing toolchain beats a conventional
+# path, or the job spends a quarter of an hour rebuilding one that already exists.
+for candidate in "${UR_TOOLCHAIN:-}" "$UR_ROOT/.toolchain" "$UR_ROOT/../toolchain"; do
+    if [[ -n $candidate && -d $candidate/bin ]]; then
+        export UR_TOOLCHAIN=$(cd -- "$candidate" && pwd)
+        break
+    fi
+done
 export UR_TOOLCHAIN=${UR_TOOLCHAIN:-$UR_ROOT/.toolchain}
 
 if [[ -d $UR_TOOLCHAIN/bin ]]; then

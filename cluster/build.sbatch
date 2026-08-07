@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=ur_build
 #SBATCH --account=torch_pr_362_general
-#SBATCH --partition=cs
+#SBATCH --partition=cpu_short,cs
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
