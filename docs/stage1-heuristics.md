@@ -206,6 +206,47 @@ worth testing. But for performance, greedy selection on regret already *is* the
 right dimensionality reduction: it reduces dimensions in the currency we care
 about.
 
+## All three rule sets
+
+Mean regret, 60,000 on-policy positions each. The findings replicate.
+
+| Model | params | Blitz | Finkel | Masters |
+| --- | --- | --- | --- | --- |
+| state features, value fit | 15 | 0.2730 | 0.3083 | 0.2541 |
+| state features, ordering fit | 15 | 0.2300 | 0.2307 | 0.1669 |
+| move features (original 12) | 13 | 0.2610 | 0.2842 | 0.2769 |
+| move features (all 22) | 23 | 0.2674 | 0.2363 | 0.2604 |
+| state + move (original) | 27 | 0.2211 | 0.2304 | 0.1580 |
+| state + move (all) | 37 | 0.2173 | 0.2135 | 0.1410 |
+| state + move (original) + pairwise | 352 | 0.1418 | 0.1330 | 0.1203 |
+| **state + move (all) + pairwise** | 667 | **0.1052** | **0.1136** | **0.0922** |
+
+The value fit loses to the ordering fit in every rule set despite having the
+higher R^2 in every one; on Masters it is 34% worse. Interactions roughly halve
+regret everywhere.
+
+Masters is the easiest to approximate and Finkel the hardest, which fits the
+structure: Masters' twelve war tiles make captures routine, while Finkel's safe
+rosettes create sharper tactical distinctions that a smooth linear score cannot
+represent.
+
+## Regret is not win rate, and the gap is large
+
+The additive Finkel model gives up 0.213 percentage points of regret per move.
+Played against the optimal agent with sides alternating, it wins **28.76%**
+(20,000 games, standard error 0.35, ceiling 50%).
+
+So a fifth of a point per move compounds into a **21-point** win-rate deficit --
+roughly a hundredfold amplification, because a game holds many decisions and the
+errors do not cancel. Anyone reading "0.2 pp regret" as "nearly optimal" would be
+badly wrong.
+
+This is the clearest argument for reporting win rate and not only regret. Larger
+runs across all models and rule sets are in progress; with several (regret, win
+rate) pairs the relationship itself becomes measurable rather than assumed, and
+it is likely sub-linear at the strong end, since a model that rarely errs also
+rarely compounds errors.
+
 ## What is not yet done
 
 - **Win rate against the optimal agent** for these models. Regret is a proxy; win
