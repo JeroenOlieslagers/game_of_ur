@@ -239,6 +239,9 @@ def main() -> None:
     steps = int(argument("--steps", 40000))
     batch = int(argument("--batch", 1 << 16))
     holdout_fraction = float(argument("--holdout", 0.0))
+    learning_rate = float(argument("--lr", 2e-3))
+    loss_kind = argument("--loss", "bce")
+    tag = argument("--tag", "")
     out_path = argument("--out", f"nn_{ruleset}_{arch}_{objective}.jsonl")
     train_successors = argument("--train-successors")
 
@@ -334,16 +337,22 @@ def main() -> None:
         width, depth = (int(part) for part in spec.lower().split("x"))
         model = build(arch, width, depth, unpack, outputs, extra).to(device)
         parameters = sum(p.numel() for p in model.parameters())
-        optimiser = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=0.0)
-        schedule = torch.optim.lr_scheduler.OneCycleLR(optimiser, max_lr=2e-3, total_steps=steps)
+        optimiser = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.0)
+        schedule = torch.optim.lr_scheduler.OneCycleLR(
+            optimiser, max_lr=learning_rate, total_steps=steps)
         started = time.time()
 
         for step in range(steps):
             if objective == "value":
                 index = train[torch.randint(0, len(train), (batch,), device=device)]
                 logits = run(model, unpack, packed[index]).squeeze(1)
-                loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                    logits, values[index] / 100.0)
+                target = values[index] / 100.0
+                if loss_kind == "bce":
+                    loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, target)
+                elif loss_kind == "mse":
+                    loss = torch.nn.functional.mse_loss(torch.sigmoid(logits), target)
+                else:
+                    raise SystemExit(f"unknown loss: {loss_kind}")
             elif objective == "ordering":
                 rows = torch.randint(0, groups["slot"].shape[0], (batch // 16,), device=device)
                 slot = groups["slot"][rows]
@@ -383,6 +392,7 @@ def main() -> None:
             "width": width, "depth": depth, "parameters": parameters,
             "bits": parameters * 32, "bits_per_state": parameters * 32 / state_count,
             "steps": steps, "batch": batch, "holdout_fraction": holdout_fraction,
+            "lr": learning_rate, "loss": loss_kind, "tag": tag,
             "seconds": round(time.time() - started, 1),
             "fit_mae": fit_mae, "fit_max_error": fit_max,
             "holdout_mae": hold_mae, "holdout_max_error": hold_max,
