@@ -3893,6 +3893,336 @@ fn expectimax_light(
     total
 }
 
+/// A transposition key that keeps light and dark distinct.
+///
+/// `pack_position` canonicalises to light-to-move, which is right for feeding a
+/// model but wrong for a transposition table holding *light-relative* values:
+/// two mirrored positions share a canonical key while their light values differ
+/// by the reflection about 50. Rather than reflect on every store and probe --
+/// the most error-prone operation in this codebase -- this key is absolute
+/// (light always 1, dark always 2) and carries the side to move, so the stored
+/// value needs no transformation at all.
+///
+/// 24 tiles at two bits, then both hands, then the turn: 55 bits.
+fn absolute_key(game: &Game) -> u64 {
+    let mut key = 0u64;
+    for tile in 0..BOARD_LEN {
+        let piece = game.board[tile];
+        let code = if piece == 0 { 0u64 } else if piece > 0 { 1 } else { 2 };
+        key |= code << (2 * tile);
+    }
+    key |= (game.light_pieces as u64) << 48;
+    key |= (game.dark_pieces as u64) << 51;
+    key |= (game.is_light_turn as u64) << 54;
+    key
+}
+
+/// Transposition entry. `flag` records what the value means once alpha-beta has
+/// been applied: exact, or a bound on one side only.
+#[derive(Clone, Copy)]
+struct Transposition {
+    key: u64,
+    value: f64,
+    depth: u8,
+    flag: u8, // 0 exact, 1 lower bound, 2 upper bound
+}
+
+/// Fixed-size, always-replace transposition table.
+///
+/// Ur transposes heavily -- moving piece A then B reaches the same position as
+/// B then A -- so a direct-mapped table recovers much of the tree without a
+/// replacement policy worth tuning.
+struct SearchTable {
+    entries: Vec<Transposition>,
+    mask: usize,
+    hits: u64,
+    probes: u64,
+}
+
+impl SearchTable {
+    fn new(bits: usize) -> Self {
+        let size = 1usize << bits;
+        Self {
+            entries: vec![Transposition { key: u64::MAX, value: 0.0, depth: 0, flag: 0 }; size],
+            mask: size - 1,
+            hits: 0,
+            probes: 0,
+        }
+    }
+
+    fn slot(&self, key: u64) -> usize {
+        // Multiplicative hash: the low bits of the key are highly structured.
+        ((key.wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> 40) as usize & self.mask
+    }
+
+    fn probe(&mut self, key: u64, depth: usize, alpha: f64, beta: f64) -> Option<f64> {
+        self.probes += 1;
+        let entry = self.entries[self.slot(key)];
+        if entry.key != key || (entry.depth as usize) < depth {
+            return None;
+        }
+        let usable = match entry.flag {
+            0 => true,
+            1 => entry.value >= beta,
+            2 => entry.value <= alpha,
+            _ => false,
+        };
+        if usable {
+            self.hits += 1;
+            Some(entry.value)
+        } else {
+            None
+        }
+    }
+
+    fn store(&mut self, key: u64, depth: usize, value: f64, alpha: f64, beta: f64) {
+        let flag = if value <= alpha { 2 } else if value >= beta { 1 } else { 0 };
+        let slot = self.slot(key);
+        self.entries[slot] = Transposition { key, value, depth: depth as u8, flag };
+    }
+}
+
+/// Expectimax with a transposition table and star1 pruning at chance nodes.
+///
+/// Returns **light's** win percentage, exactly as `expectimax_light` does, so
+/// the two are directly comparable -- and they must agree move for move, which
+/// is what `search-bench` checks. Pruning changes what is visited, never what is
+/// returned.
+///
+/// Star1 (Ballard 1983) is the alpha-beta analogue for chance nodes. A chance
+/// node's value is `sum_r p_r v_r` with every `v_r` in [0, 100], so once some
+/// outcomes are known the rest are bounded, and a child only needs searching
+/// within the window that could still push the expectation past alpha or beta.
+/// Unlike sampling the dice, it is exact.
+fn expectimax_pruned(
+    weights: Option<&[f64; WEIGHT_COUNT]>,
+    lut: &Lut,
+    game: &Game,
+    depth: usize,
+    alpha: f64,
+    beta: f64,
+    table: &mut SearchTable,
+    star: bool,
+    rng: &mut SplitMix64,
+) -> f64 {
+    if game.finished {
+        return if game.light_score >= lut.rules.pieces() { 100.0 } else { 0.0 };
+    }
+    if depth == 0 {
+        return heuristic_light_value(weights, lut, game, rng);
+    }
+    let key = absolute_key(game);
+    if let Some(value) = table.probe(key, depth, alpha, beta) {
+        return value;
+    }
+
+    let probabilities = lut.rules.roll_probabilities();
+    let mut remaining: f64 = probabilities.iter().sum();
+    let mut accumulated = 0.0;
+    let mut moves = [0i8; 8];
+    let mut result = None;
+
+    for (roll, &probability) in probabilities.iter().enumerate() {
+        if probability == 0.0 {
+            continue;
+        }
+        remaining -= probability;
+        // The window this child must land in for the chance node still to
+        // matter; untried outcomes are bounded by the value range [0, 100].
+        let (child_alpha, child_beta) = if star {
+            let low = (alpha - accumulated - 100.0 * remaining) / probability;
+            let high = (beta - accumulated) / probability;
+            (low.max(0.0), high.min(100.0))
+        } else {
+            (0.0, 100.0)
+        };
+
+        let mut rolled = game.clone();
+        let count = rolled.apply_roll(roll as u8, &mut moves);
+        let value = if count == 0 {
+            // No legal move: the turn passes, which is not a decision and does
+            // not consume a ply.
+            expectimax_pruned(weights, lut, &rolled, depth - 1, child_alpha, child_beta,
+                              table, star, rng)
+        } else {
+            let light_turn = rolled.is_light_turn;
+            let mut node_alpha = child_alpha;
+            let mut node_beta = child_beta;
+            let mut best = if light_turn { f64::NEG_INFINITY } else { f64::INFINITY };
+            for &source in &moves[..count] {
+                let mut next = rolled.clone();
+                next.apply_move(source, lut.rules);
+                let child = expectimax_pruned(weights, lut, &next, depth - 1,
+                                              node_alpha, node_beta, table, star, rng);
+                if light_turn {
+                    if child > best { best = child; }
+                    if star {
+                        node_alpha = node_alpha.max(best);
+                        if node_alpha >= node_beta { break; }
+                    }
+                } else {
+                    if child < best { best = child; }
+                    if star {
+                        node_beta = node_beta.min(best);
+                        if node_alpha >= node_beta { break; }
+                    }
+                }
+            }
+            best
+        };
+
+        if star {
+            if value <= child_alpha { result = Some(alpha); break; }
+            if value >= child_beta { result = Some(beta); break; }
+        }
+        accumulated += probability * value;
+    }
+
+    let value = result.unwrap_or(accumulated);
+    table.store(key, depth, value, alpha, beta);
+    value
+}
+
+
+/// Side investigation: does exact pruning let expectimax search deeper?
+///
+/// Three configurations at each depth -- plain, +transposition table, +table
+/// and star1 -- reporting regret, time, and how often the table hit. The
+/// correctness condition is that all three pick the **same move everywhere**:
+/// pruning and memoisation change the work done, not the answer. Any
+/// disagreement is a bug, and the check runs before the timings are believed.
+///
+/// Kept out of the stage 1 and stage 2 results: this is about how to compute an
+/// answer, not about how well a model plays.
+fn search_bench(
+    model: &Path,
+    output: &Path,
+    weights_path: &Path,
+    samples: usize,
+    max_depth: usize,
+    seed: u64,
+) {
+    let lut = Lut::read(model);
+    let text = fs::read_to_string(weights_path).expect("failed to read weights");
+    let values: Vec<f64> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.parse::<f64>().expect("weights must be one float per line"))
+        .collect();
+    assert_eq!(values.len(), WEIGHT_COUNT, "expected {WEIGHT_COUNT} state weights");
+    let mut weights = [0.0f64; WEIGHT_COUNT];
+    weights.copy_from_slice(&values);
+
+    let mut rng = SplitMix64::new(seed);
+    let mut states = Vec::with_capacity(samples);
+    let mut moves = [0i8; 8];
+    let mut game = Game::initial(lut.rules);
+    while states.len() < samples {
+        if game.finished {
+            game = Game::initial(lut.rules);
+        }
+        let roll = lut.rules.roll(&mut rng);
+        let count = game.apply_roll(roll, &mut moves);
+        if count == 0 {
+            continue;
+        }
+        if count > 1 {
+            states.push(game.clone());
+        }
+        let source = choose_optimal_move(&lut, &game, &moves[..count]);
+        game.apply_move(source, lut.rules);
+    }
+
+    let mut file = BufWriter::new(File::create(output).unwrap());
+    writeln!(file, "method,depth,states,mean_regret,agreement_pct,seconds,table_hit_pct").unwrap();
+
+    for depth in 1..=max_depth {
+        // Plain search first; its choices are the reference the other two must
+        // reproduce exactly.
+        let mut reference: Vec<i8> = Vec::with_capacity(states.len());
+        for (method, use_table, star) in
+            [("plain", false, false), ("table", true, false), ("table+star1", true, true)]
+        {
+            let started = Instant::now();
+            let mut table = SearchTable::new(if use_table { 22 } else { 1 });
+            let mut total = 0.0;
+            let mut agreed = 0usize;
+            let mut choices: Vec<i8> = Vec::with_capacity(states.len());
+            for position in &states {
+                let mut local = [0i8; 8];
+                let count = position.available_moves(&mut local);
+                let mover_is_light = position.is_light_turn;
+                let mut best_score = f64::NEG_INFINITY;
+                let mut chosen = local[0];
+                let mut best_true = f64::NEG_INFINITY;
+                let mut search_rng = SplitMix64::new(0x51ed_270b_44c9_0af3);
+                for &source in &local[..count] {
+                    let mut next = position.clone();
+                    next.apply_move(source, lut.rules);
+                    let light = if use_table || star {
+                        expectimax_pruned(Some(&weights), &lut, &next, depth - 1,
+                                          0.0, 100.0, &mut table, star, &mut search_rng)
+                    } else {
+                        expectimax_light(Some(&weights), &lut, &next, depth - 1, &mut search_rng)
+                    };
+                    let score = if mover_is_light { light } else { 100.0 - light };
+                    if score > best_score {
+                        best_score = score;
+                        chosen = source;
+                    }
+                    let true_light = lut.light_win_percent(&next);
+                    let true_value = if mover_is_light { true_light } else { 100.0 - true_light };
+                    if true_value > best_true {
+                        best_true = true_value;
+                    }
+                }
+                choices.push(chosen);
+                let mut next = position.clone();
+                next.apply_move(chosen, lut.rules);
+                let light = lut.light_win_percent(&next);
+                let chosen_true = if mover_is_light { light } else { 100.0 - light };
+                let regret = best_true - chosen_true;
+                total += regret;
+                if regret < 1e-9 {
+                    agreed += 1;
+                }
+            }
+            if method == "plain" {
+                reference = choices.clone();
+            } else {
+                let disagreements =
+                    reference.iter().zip(&choices).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    disagreements, 0,
+                    "{method} disagreed with plain search on {disagreements} of {} positions \
+                     at depth {depth}; pruning must not change the answer",
+                    states.len()
+                );
+            }
+            let mean = total / states.len() as f64;
+            let agreement = 100.0 * agreed as f64 / states.len() as f64;
+            let seconds = started.elapsed().as_secs_f64();
+            let hit_rate = if table.probes > 0 {
+                100.0 * table.hits as f64 / table.probes as f64
+            } else {
+                0.0
+            };
+            writeln!(
+                file,
+                "{method},{depth},{},{mean:.6},{agreement:.4},{seconds:.3},{hit_rate:.2}",
+                states.len()
+            )
+            .unwrap();
+            println!(
+                "{method:>12} depth={depth}: regret={mean:.4} agreement={agreement:.2}% \
+                 {seconds:.2}s table_hits={hit_rate:.1}%"
+            );
+        }
+    }
+    file.flush().unwrap();
+}
+
 /// Regret of a weighted heuristic as a function of search depth.
 ///
 /// Depth 1 is the greedy policy used everywhere else: evaluate each successor
@@ -5008,6 +5338,18 @@ fn main() {
         }
         let stride = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1usize).max(1);
         regret_all(&model, Path::new(&args[3]), stride);
+        return;
+    }
+    if command == "search-bench" {
+        if args.len() < 5 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let weights = PathBuf::from(&args[4]);
+        let samples = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(2_000);
+        let max_depth = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(5);
+        let seed = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(0x51ed_270b_44c9_0af3);
+        search_bench(&model, &output, &weights, samples, max_depth, seed);
         return;
     }
     if command == "hybrid-regret" {
