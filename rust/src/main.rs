@@ -3148,6 +3148,162 @@ fn dump_move_features(model: &Path, output: &Path, samples: usize, seed: u64) {
     eprintln!("wrote {positions} positions to {}", output.display());
 }
 
+/// A policy that scores a candidate MOVE using state features, move features and
+/// optionally their pairwise products.
+///
+/// This is what the offline fits produce, brought into the engine so the model
+/// can actually play. Two asymmetries matter:
+///
+///   * State features describe the successor from the *next* mover's
+///     perspective, so their contribution is reflected about 50 when the move
+///     passes the turn. Move features are already mover-relative and are not.
+///   * A move onto a rosette keeps the turn, so `passed` differs between the
+///     candidates of one position and no constant can be dropped as common.
+struct MovePolicy {
+    weights: Vec<f64>,
+    interactions: bool,
+}
+
+const COMBINED_COUNT: usize = FEATURE_COUNT + MOVE_FEATURE_COUNT;
+
+impl MovePolicy {
+    fn load(path: &Path) -> Self {
+        let text = fs::read_to_string(path).expect("failed to read policy weights");
+        let weights: Vec<f64> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.parse::<f64>().expect("weights must be one float per line"))
+            .collect();
+        let additive = COMBINED_COUNT + 1;
+        let quadratic = COMBINED_COUNT + COMBINED_COUNT * (COMBINED_COUNT - 1) / 2 + 1;
+        let interactions = if weights.len() == additive {
+            false
+        } else if weights.len() == quadratic {
+            true
+        } else {
+            panic!(
+                "expected {additive} weights (additive) or {quadratic} (with interactions), found {}",
+                weights.len()
+            )
+        };
+        Self { weights, interactions }
+    }
+
+    /// Score a move for the player making it. Higher is better for that player.
+    fn score(&self, lut: &Lut, rolled: &Game, source: i8, roll: usize, next: &Game) -> f64 {
+        if next.finished {
+            let mover_is_light = rolled.is_light_turn;
+            let mover_won = (next.light_score >= lut.rules.pieces()) == mover_is_light;
+            return if mover_won { f64::INFINITY } else { f64::NEG_INFINITY };
+        }
+        let state = features(lut, next);
+        let moves = move_features(lut, rolled, source, roll, next);
+        let passed = next.is_light_turn != rolled.is_light_turn;
+        let sign = if passed { -1.0 } else { 1.0 };
+
+        // Combined vector, with the state block signed so it is mover-relative.
+        let mut combined = [0.0f64; COMBINED_COUNT];
+        for (slot, value) in combined[..FEATURE_COUNT].iter_mut().zip(state) {
+            *slot = sign * value;
+        }
+        combined[FEATURE_COUNT..].copy_from_slice(&moves);
+
+        let mut total = 0.0;
+        for (value, weight) in combined.iter().zip(&self.weights) {
+            total += value * weight;
+        }
+        let mut index = COMBINED_COUNT;
+        if self.interactions {
+            for i in 0..COMBINED_COUNT {
+                for j in (i + 1)..COMBINED_COUNT {
+                    total += combined[i] * combined[j] * self.weights[index];
+                    index += 1;
+                }
+            }
+        }
+        total += sign * self.weights[index];
+        // The fit estimates the mover value minus 100 for a turn-passing move;
+        // add it back so candidates are comparable.
+        if passed { total + 100.0 } else { total }
+    }
+
+    fn choose(&self, lut: &Lut, rolled: &Game, roll: usize, moves: &[i8]) -> i8 {
+        let mut best_move = moves[0];
+        let mut best = f64::NEG_INFINITY;
+        for &source in moves {
+            let mut next = rolled.clone();
+            next.apply_move(source, lut.rules);
+            let score = self.score(lut, rolled, source, roll, &next);
+            if score > best {
+                best = score;
+                best_move = source;
+            }
+        }
+        best_move
+    }
+}
+
+/// Win rate of a weighted move policy against the optimal agent.
+///
+/// Sides alternate, so a policy that played perfectly would sit at exactly 50%.
+/// This is the ground truth that regret only approximates: it includes error
+/// compounding and the fact that a weaker agent visits different positions.
+fn policy_winrate(model: &Path, weights: &Path, games: usize, seed: u64) {
+    let lut = Lut::read(model);
+    let policy = MovePolicy::load(weights);
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let per_thread = (games + threads - 1) / threads;
+    let started = Instant::now();
+
+    let wins: usize = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for thread_index in 0..threads {
+            let count = per_thread.min(games.saturating_sub(thread_index * per_thread));
+            let lut = &lut;
+            let policy = &policy;
+            handles.push(scope.spawn(move || {
+                let mut rng = SplitMix64::new(seed ^ (thread_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                let mut moves = [0i8; 8];
+                let mut wins = 0usize;
+                for game_index in 0..count {
+                    let policy_is_light = (thread_index + game_index) % 2 == 0;
+                    let mut game = Game::initial(lut.rules);
+                    let mut plies = 0usize;
+                    while !game.finished {
+                        plies += 1;
+                        assert!(plies < 100_000, "game failed to terminate");
+                        let roll = lut.rules.roll(&mut rng) as usize;
+                        let snapshot = game.clone();
+                        let available = game.apply_roll(roll as u8, &mut moves);
+                        if available == 0 {
+                            continue;
+                        }
+                        let source = if game.is_light_turn == policy_is_light {
+                            policy.choose(lut, &game, roll, &moves[..available])
+                        } else {
+                            choose_optimal_move(lut, &game, &moves[..available])
+                        };
+                        let _ = snapshot;
+                        game.apply_move(source, lut.rules);
+                    }
+                    if (game.light_score >= lut.rules.pieces()) == policy_is_light {
+                        wins += 1;
+                    }
+                }
+                wins
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+
+    let percent = 100.0 * wins as f64 / games as f64;
+    let error = 100.0 * (0.25 / games as f64).sqrt();
+    println!("games={games} wins={wins}");
+    println!("win_pct={percent:.4} standard_error={error:.4}");
+    println!("seconds={:.1}", started.elapsed().as_secs_f64());
+}
+
 /// Exact mean regret over **every** decision in the map.
 ///
 /// Sampling is unnecessary for evaluation: each decision's regret is exact, so
@@ -3913,6 +4069,15 @@ fn main() {
         let samples = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50_000);
         let seed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x6b2f_9e11_c40d_7a35);
         dump_move_features(&model, &output, samples, seed);
+        return;
+    }
+    if command == "winrate" {
+        if args.len() < 4 {
+            usage();
+        }
+        let games = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(100_000);
+        let seed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x4d2b_8f31_ce07_a95b);
+        policy_winrate(&model, Path::new(&args[3]), games, seed);
         return;
     }
     if command == "regret-all" {
