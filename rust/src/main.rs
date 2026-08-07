@@ -4018,19 +4018,28 @@ fn dump_tensors(model: &Path, output: &Path, stride: usize, offset: usize) {
 /// evaluation set drawn separately turned out to be 100% contained in it.
 /// Enumerating the whole decision space removes both problems at once.
 ///
-/// Twelve bytes per record, little-endian: `u64` packed position, `u8` roll,
-/// `u16` mask of legal source classes, `u8` optimal source class. Sources are
-/// path indices shifted by one so that entry from hand (-1) is class 0.
-/// Positions with fewer than two legal moves carry no decision and are skipped.
+/// Sixteen bytes per record, little-endian: `u64` packed position, `u32` mask of
+/// legal source classes, `u8` roll, `u8` optimal source class, two bytes of
+/// padding. Sources are path indices shifted by one so that entry from hand
+/// (-1) is class 0. Positions with fewer than two legal moves carry no decision
+/// and are skipped.
+///
+/// The mask is a `u32` because a 16-tile path has 17 source classes, one more
+/// than a `u16` holds. Rust masks an over-wide shift rather than trapping in
+/// release, so `1u16 << 16` silently becomes bit 0 and the last path position
+/// aliases onto "enter from hand" -- which corrupts the labels rather than
+/// crashing.
 fn dump_decisions(model: &Path, output: &Path, stride: usize, offset: usize) {
     let lut = Lut::read(model);
     let stride = stride.max(1);
     let started = Instant::now();
     let mut file = BufWriter::with_capacity(1 << 22, File::create(output).unwrap());
     let mut moves = [0i8; 8];
-    let mut buffer = [0u8; 12];
+    let mut buffer = [0u8; 16];
     let mut written = 0usize;
     let mut global = 0usize;
+    let classes = lut.rules.light_path().len() + 1;
+    assert!(classes <= 32, "source classes must fit the u32 mask");
     for upper in 0..lut.maps.len() {
         let count = lut.maps[upper].count;
         let mut index = if global >= offset {
@@ -4051,11 +4060,12 @@ fn dump_decisions(model: &Path, output: &Path, stride: usize, offset: usize) {
                     if legal < 2 {
                         continue;
                     }
-                    let mut mask = 0u16;
+                    let mut mask = 0u32;
                     let mut best_class = 0u8;
                     let mut best_value = f64::NEG_INFINITY;
                     for &source in &moves[..legal] {
-                        let class = (source + 1) as u16;
+                        let class = (source + 1) as u32;
+                        assert!((class as usize) < classes, "source class out of range");
                         mask |= 1 << class;
                         let mut next = position.clone();
                         next.apply_move(source, lut.rules);
@@ -4069,9 +4079,11 @@ fn dump_decisions(model: &Path, output: &Path, stride: usize, offset: usize) {
                         }
                     }
                     buffer[..8].copy_from_slice(&pack_position(&position).to_le_bytes());
-                    buffer[8] = roll;
-                    buffer[9..11].copy_from_slice(&mask.to_le_bytes());
-                    buffer[11] = best_class;
+                    buffer[8..12].copy_from_slice(&mask.to_le_bytes());
+                    buffer[12] = roll;
+                    buffer[13] = best_class;
+                    buffer[14] = 0;
+                    buffer[15] = 0;
                     file.write_all(&buffer).unwrap();
                     written += 1;
                 }
@@ -4083,7 +4095,7 @@ fn dump_decisions(model: &Path, output: &Path, stride: usize, offset: usize) {
     file.flush().unwrap();
     eprintln!(
         "wrote {written} decisions ({:.3} GB) to {} in {:.1}s",
-        written as f64 * 12.0 / 1e9,
+        written as f64 * 16.0 / 1e9,
         output.display(),
         started.elapsed().as_secs_f64()
     );

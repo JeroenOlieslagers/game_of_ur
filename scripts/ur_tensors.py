@@ -105,14 +105,15 @@ def load_decisions(path: str, limit: int | None = None):
     being compressed shrinks to something a mid-sized model can memorise.
     """
     raw = np.memmap(path, dtype=np.uint8, mode="r")
-    count = len(raw) // 12
+    count = len(raw) // 16
     if limit is not None:
         count = min(count, limit)
-    view = raw[: 12 * count].reshape(count, 12)
+    view = raw[: 16 * count].reshape(count, 16)
     packed = view[:, :8].copy().view(np.uint64).reshape(count)
-    roll = view[:, 8].copy().astype(np.int64)
-    mask = view[:, 9:11].copy().view(np.uint16).reshape(count)
-    best = view[:, 11].copy().astype(np.int64)
+    # u32, not u16: a 16-tile path has 17 source classes.
+    mask = view[:, 8:12].copy().view(np.uint32).reshape(count)
+    roll = view[:, 12].copy().astype(np.int64)
+    best = view[:, 13].copy().astype(np.int64)
     return packed, roll, mask, best
 
 

@@ -298,7 +298,7 @@ def main() -> None:
         groups = {
             "parent": torch.from_numpy(d_packed.astype(np.int64)).to(device),
             "roll": torch.from_numpy(d_roll.astype(np.int8)).to(device),
-            "bits": torch.from_numpy(d_mask.astype(np.int32)).to(device),
+            "bits": torch.from_numpy(d_mask.astype(np.int64)).to(device),
             "best": torch.from_numpy(d_best.astype(np.int8)).to(device),
         }
         print(f"policy training set: {len(d_packed)} decisions (the full space), "
