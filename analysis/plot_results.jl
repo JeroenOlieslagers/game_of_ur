@@ -123,7 +123,7 @@ function fig2(file)
     scatter!(xs, ys, markersize=8, alpha=0.3, color=:black, strokecolor=:white, strokewidth=1);
     lines!([0, 100], [0, 100], color=:red, linestyle=:dash, linewidth=1, alpha=0.6);
     Label(f[1, 1, TopLeft()], "A", fontsize=14, font=:bold, halign=:left);
-    text!(20, 90, text="r²=$(round(cor(xs, ys); digits=7))", fontsize=10);
+    text!(20, 90, text="r=$(round(cor(xs, ys); digits=7))", fontsize=10);
 
     ax = Axis(f[1, 2], xlabel="Difference in winning probability (%)", ylabel="Number of states", limits=((nothing, nothing), (0, nothing)));
     hist!(xs .- ys, color=:transparent, strokecolor=:black, strokewidth=1, bins=10);
