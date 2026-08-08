@@ -66,8 +66,11 @@ def main() -> None:
         score = model.predict(eval_design).astype(np.float64) * 100.0
         report = evaluation.regret(score)
         # Nodes, not trees: what has to be stored to reproduce the model.
-        frame = model.get_booster().trees_to_dataframe()
-        parameters = len(frame)
+        # Counted from the text dump rather than `trees_to_dataframe`, which
+        # needs pandas for what is a line count.
+        dump = model.get_booster().get_dump()
+        parameters = sum(
+            1 for tree in dump for line in tree.splitlines() if line.strip())
         record = {"ruleset": ruleset, "family": "xgboost", "trees": trees, "depth": depth,
                   "parameters": parameters, "bits": parameters * 32,
                   "rows": len(design), "seconds": round(time.time() - started, 1), **report}
