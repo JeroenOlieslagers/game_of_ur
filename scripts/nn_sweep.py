@@ -275,7 +275,14 @@ def run(model, unpack, packed, extra=None):
 
 
 @torch.no_grad()
-def score_successors(model, unpack, packed_np, device, batch=1 << 16) -> np.ndarray:
+def score_successors(model, unpack, packed_np, device, batch=1 << 14) -> np.ndarray:
+    """Score every successor in the evaluation set.
+
+    The batch is 16384 rather than something larger because attention maps the
+    batch onto a CUDA grid dimension capped at 65535: at 2^19 the kernel fails
+    with "invalid configuration argument", and even 2^16 is one over the line.
+    A dense stack does not care, so the limit is set by the strictest consumer.
+    """
     model.eval()
     words = torch.from_numpy(packed_np.astype(np.int64)).to(device)
     out = torch.empty(len(words), device=device)
@@ -287,7 +294,7 @@ def score_successors(model, unpack, packed_np, device, batch=1 << 16) -> np.ndar
 
 
 @torch.no_grad()
-def value_error(model, unpack, packed, values, device, sample=1 << 21, chunk=1 << 16):
+def value_error(model, unpack, packed, values, device, sample=1 << 21, chunk=1 << 14):
     """Mean and max absolute value error, in win-probability points.
 
     Chunked because the activations, not the inputs, are what blow up: two
@@ -319,8 +326,8 @@ def policy_regret(model, unpack, evaluation, device) -> dict:
     parent = torch.from_numpy(evaluation.parent.astype(np.int64)).to(device)
     roll = torch.from_numpy(evaluation.roll).to(device)
     logits = torch.empty(len(parent), mask.shape[1], device=device)
-    for start in range(0, len(parent), 1 << 17):
-        chunk = slice(start, start + (1 << 17))
+    for start in range(0, len(parent), 1 << 14):
+        chunk = slice(start, start + (1 << 14))
         logits[chunk] = run(model, unpack, parent[chunk], extra=roll_onehot(roll[chunk]))
     model.train()
     legal = torch.from_numpy(mask).to(device)
