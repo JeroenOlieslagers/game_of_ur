@@ -275,7 +275,7 @@ def run(model, unpack, packed, extra=None):
 
 
 @torch.no_grad()
-def score_successors(model, unpack, packed_np, device, batch=1 << 19) -> np.ndarray:
+def score_successors(model, unpack, packed_np, device, batch=1 << 16) -> np.ndarray:
     model.eval()
     words = torch.from_numpy(packed_np.astype(np.int64)).to(device)
     out = torch.empty(len(words), device=device)
@@ -287,11 +287,24 @@ def score_successors(model, unpack, packed_np, device, batch=1 << 19) -> np.ndar
 
 
 @torch.no_grad()
-def value_error(model, unpack, packed, values, device, sample=1 << 21):
+def value_error(model, unpack, packed, values, device, sample=1 << 21, chunk=1 << 16):
+    """Mean and max absolute value error, in win-probability points.
+
+    Chunked because the activations, not the inputs, are what blow up: two
+    million rows through a width-2048 layer is 17 GB of intermediates, which
+    fits nowhere. The sample size is a statistical choice; the chunk size is a
+    memory one, and they should not be the same number.
+    """
     index = torch.randint(0, len(packed), (min(sample, len(packed)),), device=device)
-    predicted = torch.sigmoid(run(model, unpack, packed[index]).squeeze(1)) * 100.0
-    error = (predicted - values[index]).abs()
-    return float(error.mean()), float(error.max())
+    total = 0.0
+    worst = 0.0
+    for start in range(0, len(index), chunk):
+        rows = index[start:start + chunk]
+        predicted = torch.sigmoid(run(model, unpack, packed[rows]).squeeze(1)) * 100.0
+        error = (predicted - values[rows]).abs()
+        total += float(error.sum())
+        worst = max(worst, float(error.max()))
+    return total / len(index), worst
 
 
 def roll_onehot(roll: torch.Tensor) -> torch.Tensor:
