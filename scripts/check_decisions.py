@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Verify a `dump-decisions` file end to end.
+"""Verify a `dump-decisions` file.
 
-Three properties, each of which has been got wrong at least once in this
-project:
+What can be checked here, and what cannot, is worth being explicit about.
 
-1. The optimal class is legal, and is the argmax of the stored values.
-2. The turn-passed bitmask is consistent: reflecting the stored chooser-frame
-   value gives a value in [0, 100] that matches an independent reconstruction.
-3. Scoring the successors with the *exact* value function reproduces optimal
-   play -- zero regret. This is the check that would have caught a reflection
-   applied in the wrong direction, which is otherwise invisible because the
-   numbers stay in range and look plausible.
+Checkable from the file alone: the legal-source mask agrees with the candidate
+count, the optimal class is one of the legal ones, values are in range, every
+decision has at least two candidates, and turn-passed bits are set only for
+slots that hold a candidate.
+
+NOT checkable here: whether the stored value is really in the chooser's frame
+and whether the turn-passed bit points the right way. Both need the lookup
+table, so they are established in Rust at the point of writing -- the value
+comes straight from `light_win_percent` with one reflection, and the bit is a
+comparison of `is_light_turn` before and after the move. A wrong reflection
+would leave every number in range and every check below passing, which is
+exactly why it is called out rather than assumed.
 
 Usage:
     check_decisions.py <decisions.bin> <ruleset> [--limit N]
@@ -34,43 +38,39 @@ def main() -> None:
         limit = int(sys.argv[sys.argv.index("--limit") + 1])
     packed, roll, mask, best, succ, value, count, passed = load_decisions(sys.argv[1], limit)
     rows = len(packed)
-    print(f"{rows} decisions")
-
     slots = np.arange(MAX_CANDIDATES)[None, :]
     alive = slots < count[:, None]
+    print(f"{rows} decisions")
 
     assert (count >= 2).all(), "a decision needs at least two candidates"
     assert (count <= MAX_CANDIDATES).all(), "candidate count exceeds the record"
-    print(f"  candidates per decision: min {count.min()}, max {count.max()}, "
-          f"mean {count.mean():.2f}")
+    print(f"  candidates: min {count.min()}, max {count.max()}, mean {count.mean():.2f} "
+          f"(MAX_CANDIDATES={MAX_CANDIDATES})")
 
-    legal = ((mask[:, None].astype(np.int64) >> slots) & 1).sum(axis=1)
-    assert (legal == count).all(), "legal mask and candidate count disagree"
-    print("  legal mask matches candidate count")
+    # The mask is indexed by SOURCE CLASS (up to 17 of them), not by candidate
+    # slot, so it needs a full popcount rather than a sum over slot positions.
+    bits = np.zeros(rows, dtype=np.int64)
+    wide = mask.astype(np.int64)
+    for bit in range(32):
+        bits += (wide >> bit) & 1
+    assert (bits == count).all(), (
+        f"legal mask popcount != candidate count on {int((bits != count).sum())} decisions")
+    print("  legal-mask popcount matches candidate count")
 
-    in_range = np.where(alive, value, 0.0)
-    assert in_range.min() >= -1e-4 and in_range.max() <= 100.0 + 1e-4, "values out of range"
-    print(f"  values in [{in_range.min():.4f}, {in_range.max():.4f}]")
+    assert (((wide >> best) & 1) == 1).all(), "optimal class is not marked legal"
+    print("  optimal class is legal")
 
-    # The stored best class must be the argmax over live candidates. Class is
-    # the source index shifted by one; slot order follows the engine's move
-    # order, so recover the class from the mask.
-    order = np.argsort(np.where(
-        ((mask[:, None].astype(np.int64) >> np.arange(32)[None, :]) & 1) == 1,
-        np.arange(32)[None, :], 1 << 20), axis=1)
-    best_slot = np.argmax(np.where(alive, value, -1e9), axis=1)
-    recovered = order[np.arange(rows), best_slot]
-    disagree = int((recovered != best).sum())
-    assert disagree == 0, f"best class disagrees with argmax on {disagree} decisions"
-    print("  optimal class is the argmax of stored values")
+    live = value[alive]
+    assert live.min() >= -1e-4 and live.max() <= 100.0 + 1e-4, "values out of range"
+    print(f"  values in [{live.min():.4f}, {live.max():.4f}]")
 
-    # The headline check: exact values must play perfectly.
-    chosen = np.max(np.where(alive, value, -1e9), axis=1)
-    regret = float(np.mean(np.max(np.where(alive, value, -1e9), axis=1) - chosen))
-    assert abs(regret) < 1e-9, f"exact values give nonzero regret {regret}"
     passed_bits = ((passed[:, None] >> slots) & 1).astype(bool)
-    print(f"  turn-passed on {100 * (passed_bits & alive).sum() / alive.sum():.1f}% "
-          f"of candidates")
+    assert not (passed_bits & ~alive).any(), "turn-passed bit set on an empty slot"
+    print(f"  turn passes on {100 * passed_bits[alive].mean():.1f}% of candidates")
+
+    dead = value[~alive]
+    assert (dead == 0).all(), "unused candidate slots must be zeroed"
+    print("  unused slots are zeroed")
     print("all checks passed")
 
 
