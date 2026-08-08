@@ -240,13 +240,29 @@ step still buys 15-20%. It is not monotone in *agreement*: on Finkel,
 often at depth 3 than at depth 2 while having lower regret. Deeper search trades
 a few cheap ties for the expensive decisions, which is the trade one wants.
 
-**Search substitutes for capacity, at a rule-set-dependent exchange rate.**
+**Search substitutes for capacity, and given enough plies it wins everywhere.**
 Against the best depth-1 model in the table above (667 parameters), the
 15-parameter evaluator at depth 5 is better on blitz (0.0768 against 0.1052),
 level on Masters (0.0902 against 0.0922) and worse on Finkel (0.1311 against
-0.1136). Finkel resists search for the same reason it resists a linear score: its
-safe rosettes create discontinuities that neither smoothing nor averaging over
-dice will find.
+0.1136).
+
+That last case was initially read as Finkel resisting search -- its safe rosettes
+creating discontinuities that averaging over dice cannot find. **That reading was
+wrong**, and the depth 1-7 sweep shows it: Finkel's fitted evaluator reaches
+0.1016 at depth 6 and 0.0899 at depth 7, crossing the 667-parameter model between
+depths 5 and 6. Finkel needs more plies than the others, not a different kind of
+model. Fifteen parameters plus enough lookahead beat 667 parameters in every rule
+set; the exchange rate differs, the conclusion does not.
+
+Depths 4-7 for the fitted evaluator, 5,000 on-policy positions:
+
+| | d4 | d5 | d6 | d7 | best flat model |
+| --- | --- | --- | --- | --- | --- |
+| Blitz | 0.0914 | 0.0765 | 0.0603 | **0.0451** | 0.1052 |
+| Finkel | 0.1394 | 0.1207 | 0.1016 | **0.0899** | 0.1136 |
+| Masters | — | 0.0936 | 0.0826 | **0.0668** | 0.0922 |
+
+No saturation anywhere: the last ply still buys 12-25%.
 
 The exchange rate is not free. The depth-5 sweep takes 23-31 s against under
 0.05 s at depth 1-2 -- roughly 1000x the compute per decision, spent to save one
