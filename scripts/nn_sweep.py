@@ -275,7 +275,7 @@ def run(model, unpack, packed, extra=None):
 
 
 @torch.no_grad()
-def score_successors(model, unpack, packed_np, device, batch=1 << 14) -> np.ndarray:
+def score_successors(model, unpack, packed_np, device, batch=1 << 14, squash=True) -> np.ndarray:
     """Score every successor in the evaluation set.
 
     The batch is 16384 rather than something larger because attention maps the
@@ -288,7 +288,8 @@ def score_successors(model, unpack, packed_np, device, batch=1 << 14) -> np.ndar
     out = torch.empty(len(words), device=device)
     for start in range(0, len(words), batch):
         chunk = words[start:start + batch]
-        out[start:start + batch] = torch.sigmoid(run(model, unpack, chunk).squeeze(1)) * 100.0
+        raw = run(model, unpack, chunk).squeeze(1)
+        out[start:start + batch] = torch.sigmoid(raw) * 100.0 if squash else raw
     model.train()
     return out.cpu().numpy().astype(np.float64)
 
@@ -470,8 +471,12 @@ def main() -> None:
                 # The model returns the value to whoever moves in the
                 # successor; the targets are in the chooser's frame. Reflect
                 # about 50 exactly where the move handed the turn over.
-                score = torch.sigmoid(run(model, unpack, flat).squeeze(1)) * 100.0
-                score = score.view(succ.shape)
+                # No sigmoid here. Centring already removes the level, so the
+                # output needs no bounding -- and squashing to [0, 100] is
+                # actively harmful: sibling gaps are around 1 point in 100, so
+                # the centred residuals are tiny and the sigmoid derivative
+                # shrinks an already-weak gradient until nothing learns.
+                score = run(model, unpack, flat).squeeze(1).view(succ.shape)
                 score = torch.where(groups["passed"][rows], 100.0 - score, score)
                 target = groups["value"][rows]
                 # Within-position centring, which is exactly what stage 1's
@@ -508,9 +513,16 @@ def main() -> None:
             report = policy_regret(model, unpack, evaluation, device)
             fit_mae = fit_max = hold_mae = hold_max = float("nan")
         else:
-            report = evaluation.regret(score_successors(model, unpack, evaluation.packed, device))
-            fit_mae, fit_max = value_error(model, unpack, packed[train], values[train], device)
-            hold_mae, hold_max = value_error(model, unpack, packed[holdout], values[holdout], device)
+            report = evaluation.regret(score_successors(
+                model, unpack, evaluation.packed, device, squash=objective != "ordering"))
+            if objective == "ordering":
+                # An unsquashed ordering model estimates values only up to an
+                # additive constant per position, so absolute value error is
+                # not a meaningful number for it.
+                fit_mae = fit_max = hold_mae = hold_max = float("nan")
+            else:
+                fit_mae, fit_max = value_error(model, unpack, packed[train], values[train], device)
+                hold_mae, hold_max = value_error(model, unpack, packed[holdout], values[holdout], device)
         record = {
             "ruleset": ruleset, "arch": arch, "objective": objective, "size": spec,
             "width": width, "depth": depth, "parameters": parameters,
