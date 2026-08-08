@@ -3672,6 +3672,230 @@ fn rules_winrate(model: &Path, rules_path: &Path, games: usize, seed: u64) {
     println!("seconds={:.1}", started.elapsed().as_secs_f64());
 }
 
+
+/// A dense value network, evaluated inside the engine so it can play.
+///
+/// Regret is exact and cheap; win rate against the optimal agent is the ground
+/// truth, and it needs online move choice. Rather than link a tensor library,
+/// the forward pass is a hand-rolled matmul over weights exported by
+/// `scripts/export_net.py` -- an MLP is small enough that this is a dozen lines
+/// and keeps the engine free of dependencies.
+struct ValueNet {
+    layers: Vec<(Vec<f64>, Vec<f64>, usize, usize)>, // weight, bias, in, out
+    inputs: usize,
+}
+
+impl ValueNet {
+    fn load(path: &Path) -> Self {
+        let text = fs::read_to_string(path).expect("failed to read network");
+        let mut numbers = text.split_ascii_whitespace();
+        let mut next = || {
+            numbers
+                .next()
+                .expect("network file ended early")
+                .parse::<f64>()
+                .expect("network file must contain only numbers")
+        };
+        let count = next() as usize;
+        let mut layers = Vec::with_capacity(count);
+        let mut inputs = 0usize;
+        for layer in 0..count {
+            let in_dim = next() as usize;
+            let out_dim = next() as usize;
+            if layer == 0 {
+                inputs = in_dim;
+            }
+            let weight: Vec<f64> = (0..in_dim * out_dim).map(|_| next()).collect();
+            let bias: Vec<f64> = (0..out_dim).map(|_| next()).collect();
+            layers.push((weight, bias, in_dim, out_dim));
+        }
+        Self { layers, inputs }
+    }
+
+    /// One-hot encoding matching `Unpacker.dense` in nn_sweep.py: 20 usable
+    /// tiles over {empty, mover, other}, then both hands. A mismatch here would
+    /// be silent, so the input width is asserted against the network's.
+    fn encode(&self, lut: &Lut, game: &Game) -> Vec<f64> {
+        let canonical;
+        let view = if game.is_light_turn {
+            game
+        } else {
+            canonical = game.reverse_players();
+            &canonical
+        };
+        let tiles = usable_tiles(lut.rules);
+        let pieces = lut.rules.pieces() as usize;
+        let hand_width = pieces + 1;
+        let mut out = vec![0.0; 3 * tiles.len() + 2 * hand_width];
+        for (slot, &tile) in tiles.iter().enumerate() {
+            let piece = view.board[tile];
+            let code = if piece == 0 { 0 } else if piece > 0 { 1 } else { 2 };
+            out[3 * slot + code] = 1.0;
+        }
+        let base = 3 * tiles.len();
+        out[base + (view.light_pieces as usize).min(pieces)] = 1.0;
+        out[base + hand_width + (view.dark_pieces as usize).min(pieces)] = 1.0;
+        out
+    }
+
+    /// Win percentage for the player to move.
+    fn value(&self, lut: &Lut, game: &Game) -> f64 {
+        let mut activations = self.encode(lut, game);
+        assert_eq!(activations.len(), self.inputs, "input width does not match the network");
+        for (index, (weight, bias, in_dim, out_dim)) in self.layers.iter().enumerate() {
+            let mut next = vec![0.0; *out_dim];
+            for row in 0..*out_dim {
+                let mut sum = bias[row];
+                let offset = row * in_dim;
+                for column in 0..*in_dim {
+                    sum += weight[offset + column] * activations[column];
+                }
+                // ReLU everywhere but the output.
+                next[row] = if index + 1 < self.layers.len() { sum.max(0.0) } else { sum };
+            }
+            activations = next;
+        }
+        100.0 / (1.0 + (-activations[0]).exp())
+    }
+
+    /// Pick the move the network scores highest, from the mover's point of view.
+    ///
+    /// The network returns the value to whoever moves in the successor, so a
+    /// move that hands the turn over is worth `100 - value` to the chooser --
+    /// the reflection about 50, applied once, here.
+    fn choose(&self, lut: &Lut, game: &Game, moves: &[i8]) -> i8 {
+        let mover_is_light = game.is_light_turn;
+        let mut best = f64::NEG_INFINITY;
+        let mut chosen = moves[0];
+        for &source in moves {
+            let mut next = game.clone();
+            next.apply_move(source, lut.rules);
+            let score = if next.finished {
+                100.0
+            } else {
+                let value = self.value(lut, &next);
+                if next.is_light_turn == mover_is_light { value } else { 100.0 - value }
+            };
+            if score > best {
+                best = score;
+                chosen = source;
+            }
+        }
+        chosen
+    }
+}
+
+/// The 20 board slots either player can occupy, ascending.
+fn usable_tiles(rules: RuleSet) -> Vec<usize> {
+    let mut tiles: Vec<usize> = rules
+        .light_path()
+        .iter()
+        .chain(rules.dark_path().iter())
+        .copied()
+        .collect();
+    tiles.sort_unstable();
+    tiles.dedup();
+    tiles
+}
+
+/// Win rate for an exported network against the optimal agent.
+fn net_winrate(model: &Path, net_path: &Path, games: usize, seed: u64) {
+    let lut = Lut::read(model);
+    let net = ValueNet::load(net_path);
+    eprintln!("network: {} layers, {} inputs", net.layers.len(), net.inputs);
+
+    // Regret on the same on-policy sample the sweeps use, so the win rate can
+    // be read against a regret figure produced by the engine rather than by the
+    // training script -- a disagreement would mean the export is wrong.
+    let mut rng = SplitMix64::new(seed ^ 0x1234_5678);
+    let mut moves = [0i8; 8];
+    let mut game = Game::initial(lut.rules);
+    let mut total = 0.0;
+    let mut positions = 0usize;
+    while positions < 20_000 {
+        if game.finished {
+            game = Game::initial(lut.rules);
+        }
+        let roll = lut.rules.roll(&mut rng);
+        let count = game.apply_roll(roll, &mut moves);
+        if count == 0 {
+            continue;
+        }
+        if count > 1 {
+            let mover_is_light = game.is_light_turn;
+            let chosen = net.choose(&lut, &game, &moves[..count]);
+            let mut best = f64::NEG_INFINITY;
+            for &source in &moves[..count] {
+                let mut next = game.clone();
+                next.apply_move(source, lut.rules);
+                let light = lut.light_win_percent(&next);
+                let value = if mover_is_light { light } else { 100.0 - light };
+                if value > best {
+                    best = value;
+                }
+            }
+            let mut next = game.clone();
+            next.apply_move(chosen, lut.rules);
+            let light = lut.light_win_percent(&next);
+            let taken = if mover_is_light { light } else { 100.0 - light };
+            total += best - taken;
+            positions += 1;
+        }
+        let optimal = choose_optimal_move(&lut, &game, &moves[..count]);
+        game.apply_move(optimal, lut.rules);
+    }
+    println!("engine_regret={:.6} over {positions} positions", total / positions as f64);
+
+    let threads = thread::available_parallelism().map(usize::from).unwrap_or(1).max(1);
+    let per_thread = (games + threads - 1) / threads;
+    let started = Instant::now();
+    let wins: usize = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for thread_index in 0..threads {
+            let count = per_thread.min(games.saturating_sub(thread_index * per_thread));
+            let lut = &lut;
+            let net = &net;
+            handles.push(scope.spawn(move || {
+                let mut rng = SplitMix64::new(
+                    seed ^ (thread_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                let mut moves = [0i8; 8];
+                let mut wins = 0usize;
+                for game_index in 0..count {
+                    let net_is_light = (thread_index + game_index) % 2 == 0;
+                    let mut game = Game::initial(lut.rules);
+                    let mut plies = 0usize;
+                    while !game.finished {
+                        plies += 1;
+                        assert!(plies < 100_000, "game failed to terminate");
+                        let roll = lut.rules.roll(&mut rng);
+                        let available = game.apply_roll(roll, &mut moves);
+                        if available == 0 {
+                            continue;
+                        }
+                        let source = if game.is_light_turn == net_is_light {
+                            net.choose(lut, &game, &moves[..available])
+                        } else {
+                            choose_optimal_move(lut, &game, &moves[..available])
+                        };
+                        game.apply_move(source, lut.rules);
+                    }
+                    if (game.light_score >= lut.rules.pieces()) == net_is_light {
+                        wins += 1;
+                    }
+                }
+                wins
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+
+    let percent = 100.0 * wins as f64 / games as f64;
+    let error = 100.0 * (0.25 / games as f64).sqrt();
+    println!("games={games} wins={wins}");
+    println!("win_pct={percent:.4} standard_error={error:.4}");
+    println!("seconds={:.1}", started.elapsed().as_secs_f64());
+}
+
 fn policy_winrate(model: &Path, weights: &Path, games: usize, seed: u64) {
     let lut = Lut::read(model);
     let policy = MovePolicy::load(weights);
@@ -5363,6 +5587,15 @@ fn main() {
         }
         // model is args[2] = the rules file here.
         check_rules(&model, Path::new(&args[3]));
+        return;
+    }
+    if command == "winrate-net" {
+        if args.len() < 4 {
+            usage();
+        }
+        let games = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let seed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x4d2b_8f31_ce07_a95b);
+        net_winrate(&model, Path::new(&args[3]), games, seed);
         return;
     }
     if command == "winrate-rules" {
