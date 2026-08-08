@@ -10,6 +10,9 @@ use std::time::Instant;
 const WIDTH: usize = 3;
 const HEIGHT: usize = 8;
 const BOARD_LEN: usize = WIDTH * HEIGHT;
+/// Most legal moves a single roll can offer: at most one per piece on the
+/// board plus entry from hand, so seven pieces gives eight.
+const MAX_CANDIDATES: usize = 8;
 const ROSETTES: [usize; 5] = [0, 2, 10, 18, 20];
 const LOOKUP_PREFIX_BITS: usize = 20;
 const LOOKUP_PREFIX_COUNT: usize = 1 << LOOKUP_PREFIX_BITS;
@@ -4923,11 +4926,26 @@ fn dump_tensors(model: &Path, output: &Path, stride: usize, offset: usize) {
 /// evaluation set drawn separately turned out to be 100% contained in it.
 /// Enumerating the whole decision space removes both problems at once.
 ///
-/// Sixteen bytes per record, little-endian: `u64` packed position, `u32` mask of
-/// legal source classes, `u8` roll, `u8` optimal source class, two bytes of
-/// padding. Sources are path indices shifted by one so that entry from hand
-/// (-1) is class 0. Positions with fewer than two legal moves carry no decision
-/// and are skipped.
+/// Record layout, little-endian, 16 + 12 * MAX_CANDIDATES bytes:
+///
+///   u64 packed position, u32 legal-source mask, u8 roll, u8 optimal class,
+///   u8 candidate count, u8 turn-passed bitmask, then per candidate:
+///   u64 packed successor, f32 value to the player who is choosing.
+///
+/// The turn-passed bit per candidate is not redundant. The stored value is in
+/// the *chooser's* frame, while a model given the canonicalised successor
+/// returns a value in the *successor mover's* frame; those differ by the
+/// reflection about 50 exactly when the move hands the turn over. Without this
+/// bit a per-successor scorer would train against mismatched targets.
+///
+/// Sources are path indices shifted by one so entry from hand (-1) is class 0.
+/// Positions with fewer than two legal moves carry no decision and are skipped.
+///
+/// The successors are here so that a *per-successor* scorer can be trained on
+/// the whole decision space, which is what makes value-versus-ordering a clean
+/// comparison: one architecture, one training set, only the objective differs.
+/// Without them the ordering objective can only be trained on a sample, and a
+/// sample small enough to fit in memory is small enough to memorise.
 ///
 /// The mask is a `u32` because a 16-tile path has 17 source classes, one more
 /// than a `u16` holds. Rust masks an over-wide shift rather than trapping in
@@ -4940,9 +4958,10 @@ fn dump_decisions(model: &Path, output: &Path, stride: usize, offset: usize) {
     let started = Instant::now();
     let mut file = BufWriter::with_capacity(1 << 22, File::create(output).unwrap());
     let mut moves = [0i8; 8];
-    let mut buffer = [0u8; 16];
+    let mut buffer = [0u8; 16 + 12 * MAX_CANDIDATES];
     let mut written = 0usize;
     let mut global = 0usize;
+    let mut truncated = 0usize;
     let classes = lut.rules.light_path().len() + 1;
     assert!(classes <= 32, "source classes must fit the u32 mask");
     for upper in 0..lut.maps.len() {
@@ -4968,6 +4987,9 @@ fn dump_decisions(model: &Path, output: &Path, stride: usize, offset: usize) {
                     let mut mask = 0u32;
                     let mut best_class = 0u8;
                     let mut best_value = f64::NEG_INFINITY;
+                    let mut candidates = 0usize;
+                    let mut passed_mask = 0u8;
+                    buffer[16..].fill(0);
                     for &source in &moves[..legal] {
                         let class = (source + 1) as u32;
                         assert!((class as usize) < classes, "source class out of range");
@@ -4982,13 +5004,26 @@ fn dump_decisions(model: &Path, output: &Path, stride: usize, offset: usize) {
                             best_value = value;
                             best_class = class as u8;
                         }
+                        if candidates < MAX_CANDIDATES {
+                            if next.is_light_turn != position.is_light_turn {
+                                passed_mask |= 1u8 << candidates;
+                            }
+                            let at = 16 + 12 * candidates;
+                            buffer[at..at + 8]
+                                .copy_from_slice(&pack_position(&next).to_le_bytes());
+                            buffer[at + 8..at + 12]
+                                .copy_from_slice(&(value as f32).to_le_bytes());
+                            candidates += 1;
+                        } else {
+                            truncated += 1;
+                        }
                     }
                     buffer[..8].copy_from_slice(&pack_position(&position).to_le_bytes());
                     buffer[8..12].copy_from_slice(&mask.to_le_bytes());
                     buffer[12] = roll;
                     buffer[13] = best_class;
-                    buffer[14] = 0;
-                    buffer[15] = 0;
+                    buffer[14] = candidates as u8;
+                    buffer[15] = passed_mask;
                     file.write_all(&buffer).unwrap();
                     written += 1;
                 }
@@ -4998,9 +5033,12 @@ fn dump_decisions(model: &Path, output: &Path, stride: usize, offset: usize) {
         global += count;
     }
     file.flush().unwrap();
+    // Truncation would silently drop candidates from the ordering objective,
+    // so it is reported rather than left to be discovered.
+    assert_eq!(truncated, 0, "{truncated} candidates exceeded MAX_CANDIDATES");
     eprintln!(
         "wrote {written} decisions ({:.3} GB) to {} in {:.1}s",
-        written as f64 * 16.0 / 1e9,
+        written as f64 * (16 + 12 * MAX_CANDIDATES) as f64 / 1e9,
         output.display(),
         started.elapsed().as_secs_f64()
     );

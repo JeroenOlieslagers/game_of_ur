@@ -27,6 +27,7 @@ from __future__ import annotations
 import numpy as np
 
 BOARD_LEN = 24
+MAX_CANDIDATES = 8
 
 PATHS = {
     "blitz": ([9, 6, 3, 0, 1, 4, 7, 10, 13, 16, 19, 20, 23, 22, 21, 18],
@@ -99,22 +100,30 @@ def path_occupancy(packed: np.ndarray, ruleset: str) -> np.ndarray:
 def load_decisions(path: str, limit: int | None = None):
     """Memory-map a `dump-decisions` file: every decision in the game.
 
-    Returns (packed position, roll, legal-source mask, optimal source class).
-    This is the policy analogue of the full table: training a policy head on a
-    sampled subset instead makes the rate axis meaningless, because the object
-    being compressed shrinks to something a mid-sized model can memorise.
+    Returns (packed position, roll, legal mask, optimal class, successor packed,
+    successor value, candidate count, turn-passed bitmask). The successors make the whole decision
+    space usable by a *per-successor* scorer, which is what lets value and
+    ordering be compared at one architecture on one training set.
+
+    Record: u64 position, u32 mask, u8 roll, u8 best, u8 count, u8 pad,
+    then 8 x (u64 successor, f32 value to the chooser).
     """
+    stride = 16 + 12 * MAX_CANDIDATES
     raw = np.memmap(path, dtype=np.uint8, mode="r")
-    count = len(raw) // 16
+    count = len(raw) // stride
     if limit is not None:
         count = min(count, limit)
-    view = raw[: 16 * count].reshape(count, 16)
+    view = raw[: stride * count].reshape(count, stride)
     packed = view[:, :8].copy().view(np.uint64).reshape(count)
-    # u32, not u16: a 16-tile path has 17 source classes.
     mask = view[:, 8:12].copy().view(np.uint32).reshape(count)
     roll = view[:, 12].copy().astype(np.int64)
     best = view[:, 13].copy().astype(np.int64)
-    return packed, roll, mask, best
+    candidates = view[:, 14].copy().astype(np.int64)
+    passed = view[:, 15].copy().astype(np.int64)
+    block = view[:, 16:].copy().reshape(count, MAX_CANDIDATES, 12)
+    successors = block[:, :, :8].copy().view(np.uint64).reshape(count, MAX_CANDIDATES)
+    values = block[:, :, 8:].copy().view(np.float32).reshape(count, MAX_CANDIDATES)
+    return packed, roll, mask, best, successors, values, candidates, passed
 
 
 def load_tensors(path: str, limit: int | None = None) -> tuple[np.ndarray, np.ndarray]:

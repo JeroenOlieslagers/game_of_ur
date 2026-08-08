@@ -379,51 +379,41 @@ def main() -> None:
         print(f"table: {len(packed)} states, all used for fitting", flush=True)
 
     groups = None
-    if objective == "policy":
-        # The whole decision space, not a sample of it. A policy trained on a
+    if objective in ("policy", "ordering"):
+        # The whole decision space, not a sample of it. A model trained on a
         # sample compresses that sample; with on-policy sampling the evaluation
         # positions are a subset of it, and the measurement becomes circular.
         decisions_path = argument("--decisions")
         if not decisions_path:
-            raise SystemExit("--decisions is required for the policy objective")
-        # Masters has ~1.9 billion decisions, or 27 GB once on the device.
-        # Capping keeps it inside a 48 GB GPU; the capped set is still three
-        # orders of magnitude larger than any model here, so it stays a
-        # compression problem rather than a memorisation one.
+            raise SystemExit(f"--decisions is required for the {objective} objective")
         max_decisions = argument("--max-decisions")
-        d_packed, d_roll, d_mask, d_best = load_decisions(
+        (d_packed, d_roll, d_mask, d_best, d_succ, d_val, d_count,
+         d_passed) = load_decisions(
             decisions_path, int(max_decisions) if max_decisions else None)
-        # The mask stays packed into an int32 and is expanded per batch. Held
-        # as a bool matrix it would be 1.2 billion decisions x 17 classes for
-        # Masters -- 20 GB to store what a shift and an AND recompute for free.
-        groups = {
-            "parent": torch.from_numpy(d_packed.astype(np.int64)).to(device),
-            "roll": torch.from_numpy(d_roll.astype(np.int8)).to(device),
-            "bits": torch.from_numpy(d_mask.astype(np.int64)).to(device),
-            "best": torch.from_numpy(d_best.astype(np.int8)).to(device),
-        }
-        print(f"policy training set: {len(d_packed)} decisions (the full space), "
+        if objective == "policy":
+            # The mask stays packed into an int32 and is expanded per batch.
+            groups = {
+                "parent": torch.from_numpy(d_packed.astype(np.int64)).to(device),
+                "roll": torch.from_numpy(d_roll.astype(np.int8)).to(device),
+                "bits": torch.from_numpy(d_mask.astype(np.int32)).to(device),
+                "best": torch.from_numpy(d_best.astype(np.int8)).to(device),
+            }
+        else:
+            # Per-successor scoring over the same decisions the value objective
+            # sees, so the two differ only in what they are asked to predict.
+            slots = np.arange(d_succ.shape[1])[None, :]
+            alive = slots < d_count[:, None]
+            passed = ((d_passed[:, None] >> slots) & 1).astype(bool)
+            groups = {
+                "succ": torch.from_numpy(d_succ.astype(np.int64)).to(device),
+                "value": torch.from_numpy(d_val.astype(np.float32)).to(device),
+                "alive": torch.from_numpy(alive).to(device),
+                "passed": torch.from_numpy(passed).to(device),
+                "best": torch.from_numpy(
+                    np.argmax(np.where(alive, d_val, -1e9), axis=1).astype(np.int64)).to(device),
+            }
+        print(f"{objective} training set: {len(d_packed)} decisions (the full space), "
               f"{sum(v.element_size() * v.numel() for v in groups.values()) / 1e9:.1f} GB",
-              flush=True)
-    elif objective == "ordering":
-        if not train_successors:
-            raise SystemExit(f"--train-successors is required for the {objective} objective")
-        training_set = Successors(train_successors, ruleset)
-        widest = int(training_set.counts.max())
-        slot = np.full((len(training_set), widest), -1, dtype=np.int64)
-        for row, (offset, count) in enumerate(zip(training_set.offsets, training_set.counts)):
-            slot[row, :count] = np.arange(offset, offset + count)
-        groups = {
-            "slot": torch.from_numpy(slot).to(device),
-            "mask": torch.from_numpy(slot >= 0).to(device),
-            "packed": torch.from_numpy(training_set.packed.astype(np.int64)).to(device),
-            "passed": torch.from_numpy(training_set.passed.astype(np.float32)).to(device),
-            "best": torch.from_numpy(
-                np.argmax(np.where(slot >= 0, training_set.value[np.clip(slot, 0, None)], -1e9),
-                          axis=1)).to(device),
-        }
-        print(f"ordering training set: {len(training_set)} positions "
-              f"-- NOTE: a sample, so its rate axis is not comparable to value/policy",
               flush=True)
 
     classes = unpack.path_length + 1
@@ -453,16 +443,18 @@ def main() -> None:
                 else:
                     raise SystemExit(f"unknown loss: {loss_kind}")
             elif objective == "ordering":
-                rows = torch.randint(0, groups["slot"].shape[0], (batch // 16,), device=device)
-                slot = groups["slot"][rows]
-                mask = groups["mask"][rows]
-                flat = slot.clamp(min=0).reshape(-1)
-                value = torch.sigmoid(run(model, unpack, groups["packed"][flat]).squeeze(1)) * 100.0
-                # Reflect about 50 exactly where the move hands the turn over.
-                passed = groups["passed"][flat]
-                value = torch.where(passed > 0, 100.0 - value, value)
-                value = value.view(slot.shape).masked_fill(~mask, -1e9)
-                loss = torch.nn.functional.cross_entropy(value, groups["best"][rows])
+                rows = torch.randint(0, groups["succ"].shape[0], (batch // 8,), device=device)
+                succ = groups["succ"][rows]
+                alive = groups["alive"][rows]
+                flat = succ.reshape(-1)
+                # The model returns the value to whoever moves in the
+                # successor; the targets are in the chooser's frame. Reflect
+                # about 50 exactly where the move handed the turn over.
+                score = torch.sigmoid(run(model, unpack, flat).squeeze(1)) * 100.0
+                score = score.view(succ.shape)
+                score = torch.where(groups["passed"][rows], 100.0 - score, score)
+                score = score.masked_fill(~alive, -1e9)
+                loss = torch.nn.functional.cross_entropy(score, groups["best"][rows])
             else:
                 rows = torch.randint(0, len(groups["parent"]), (batch // 4,), device=device)
                 logits = run(model, unpack, groups["parent"][rows],
