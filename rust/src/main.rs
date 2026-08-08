@@ -3958,7 +3958,13 @@ impl SearchTable {
     fn probe(&mut self, key: u64, depth: usize, alpha: f64, beta: f64) -> Option<f64> {
         self.probes += 1;
         let entry = self.entries[self.slot(key)];
-        if entry.key != key || (entry.depth as usize) < depth {
+        // Exact depth match, not the usual `entry.depth >= depth`. That rule
+        // assumes a deeper search is a strictly better estimate of one
+        // quantity, which holds when the leaves are terminal positions. Here
+        // the leaves are a *heuristic*, so depth-5 and depth-3 values are
+        // different functions; reusing the deeper one silently changes what a
+        // fixed-depth search returns.
+        if entry.key != key || entry.depth as usize != depth {
             return None;
         }
         let usable = match entry.flag {
