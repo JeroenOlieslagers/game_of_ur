@@ -473,8 +473,21 @@ def main() -> None:
                 score = torch.sigmoid(run(model, unpack, flat).squeeze(1)) * 100.0
                 score = score.view(succ.shape)
                 score = torch.where(groups["passed"][rows], 100.0 - score, score)
-                score = score.masked_fill(~alive, -1e9)
-                loss = torch.nn.functional.cross_entropy(score, groups["best"][rows])
+                target = groups["value"][rows]
+                # Within-position centring, which is exactly what stage 1's
+                # "ordering fit" was: subtract each position's mean from both
+                # prediction and target, annihilating the component that is
+                # constant across siblings and cannot affect the choice.
+                #
+                # NOT a softmax over these scores. They live on a 0-100 scale,
+                # so `cross_entropy` sees logits of magnitude 100, saturates,
+                # and stops producing gradients -- which shows up as a model
+                # that does not learn at any capacity rather than as an error.
+                live = alive.float()
+                counts = live.sum(dim=1, keepdim=True).clamp(min=1.0)
+                score = (score - (score * live).sum(dim=1, keepdim=True) / counts) * live
+                target = (target - (target * live).sum(dim=1, keepdim=True) / counts) * live
+                loss = ((score - target) ** 2).sum() / live.sum()
             else:
                 rows = torch.randint(0, len(groups["parent"]), (batch // 4,), device=device)
                 logits = run(model, unpack, groups["parent"][rows],
