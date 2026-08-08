@@ -337,6 +337,41 @@ distribution rather than a function of current occupancy, so recovering them
 means learning to simulate a roll. They were also top of the stage-1
 Shapley-over-regret ranking.
 
+### Model families do not trace one envelope
+
+Gradient boosting on the same inputs and the same evaluation set, capacity swept
+as trees x depth, with parameters counted as tree nodes:
+
+| nodes | regret | MLP at comparable size |
+| --- | --- | --- |
+| 1,550 | 0.3142 | — |
+| 25,398 | 0.2608 | 0.0282 (25,985 params) |
+| 303,086 | 0.1786 | — |
+| 3,626,490 | 0.0730 | 0.0058 (2.2M params) |
+
+**Boosted trees are 9-12x worse per parameter than a dense net**, and that
+understates it: a tree node stores a feature index, a threshold and two child
+pointers, so it costs more than one float while being counted as one.
+
+Boosting is not minibatch-incremental, so this trained on 4M of 41M states,
+which raises the obvious objection that the trees are sample-limited rather than
+capacity-limited. Rerunning at 20M rows moves nothing: -2.4%, +4.8%, -5.3%,
+-8.6% at the four sizes, one of them in the wrong direction. The gap is real.
+
+The mechanism is a mismatch between the target and axis-aligned splits. The
+input is one-hot occupancy, and the quantities that matter -- total advancement,
+number of safe pieces -- are weighted sums over many indicators. A dense layer
+computes one in a single operation; a tree approximates it with a deep cascade
+of splits. This is a statement about representation, not about boosting being a
+weak learner.
+
+**Consequence for how stage 2 should be stated.** A claim like "this rule set
+needs N bits" survives only as an upper bound achieved by the best known family,
+not as a property of Ur. The rate-distortion curve measured here describes dense
+networks; the reference quantisation curve describes the table. Whether some
+third family sits below both is open, and the transformer sweep is the next test
+of it.
+
 ### How much of this is noise
 
 Two runs differing only in seed:
