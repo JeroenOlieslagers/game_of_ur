@@ -30,7 +30,9 @@ import numpy as np
 
 STATE = ["advancement_self", "advancement_opp", "scored_self", "scored_opp",
          "hand_self", "hand_opp", "safe_self", "safe_opp", "exposure_self",
-         "threat_self", "centre_self", "centre_opp", "frontmost_self", "frontmost_opp"]
+         "threat_self", "centre_self", "centre_opp", "frontmost_self", "frontmost_opp",
+         "stuck_self", "stuck_opp", "selfblock_self", "selfblock_opp",
+         "rosettes_self", "rosettes_opp"]
 MOVE = ["advance", "captures", "scores", "enters", "lands_rosette", "lands_centre",
         "leaves_centre", "dest_safe", "src_was_exposed", "delta_exposure",
         "delta_threat", "keeps_turn", "capture_value", "rescue_value",

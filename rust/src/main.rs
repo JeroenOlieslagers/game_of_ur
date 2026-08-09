@@ -2340,7 +2340,7 @@ fn validate_encoding(lut: &TrainingLut, samples: usize) {
 // same shape as Lut::light_win_percent -- so one argmax routine serves them all.
 // ---------------------------------------------------------------------------
 
-const FEATURE_COUNT: usize = 14;
+const FEATURE_COUNT: usize = 20;
 /// Every feature is paired self/opponent, so a weight vector can be made
 /// antisymmetric. That matters: a position's value from the mover's view and
 /// from the opponent's view are related by `v -> 100 - v`, so only an
@@ -2352,6 +2352,10 @@ const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
     "hand_self", "hand_opp", "safe_self", "safe_opp",
     "exposure_self", "threat_self", "centre_self", "centre_opp",
     "frontmost_self", "frontmost_opp",
+    // Blocking and geometry, the gap stage 1 identified: two positions with
+    // identical aggregates differ in whether a player can actually move.
+    "stuck_self", "stuck_opp", "selfblock_self", "selfblock_opp",
+    "rosettes_self", "rosettes_opp",
 ];
 /// Weight vectors carry a trailing intercept, so a score is on the 0-100
 /// win-percentage scale and can be reflected the same way the table's values are.
@@ -2361,6 +2365,69 @@ const WEIGHT_COUNT: usize = FEATURE_COUNT + 1;
 ///
 /// Board pieces store their own path index (`sign * (path_index + 1)`), so
 /// advancement is just the sum of the stored magnitudes.
+
+/// Blocking, which no aggregate feature expresses.
+///
+/// Returns `(stuck, selfblock)` for one player:
+///
+///   * `stuck` -- `sum_r P(r) * 1[no legal move with roll r]`. Being unable to
+///     move at all is the purest form of being blocked, and it is invisible to
+///     every existing feature: advancement, exposure and threat are identical
+///     whether or not a position can actually be played.
+///   * `selfblock` -- `sum_r P(r) * 1[some piece is stopped by one of its own]`.
+///     A player's own pieces obstruct each other, since a move cannot land on a
+///     friendly piece, so congestion is self-inflicted and worth separating
+///     from being blocked by the opponent.
+///
+/// Roll 0 is skipped: it passes the turn by the dice rather than by the
+/// position, so counting it would add a constant to every state.
+fn blocking(lut: &Lut, game: &Game, for_mover: bool) -> (f64, f64) {
+    let mut probe = game.clone();
+    if !for_mover {
+        probe.is_light_turn = !probe.is_light_turn;
+    }
+    probe.roll = -1;
+    let sign = probe.turn_sign();
+    let path = if probe.is_light_turn { lut.rules.light_path() } else { lut.rules.dark_path() };
+    let mut stuck = 0.0;
+    let mut selfblock = 0.0;
+    let mut moves = [0i8; 8];
+    for (roll, &probability) in lut.rules.roll_probabilities().iter().enumerate() {
+        if roll == 0 || probability == 0.0 {
+            continue;
+        }
+        let mut rolled = probe.clone();
+        if rolled.apply_roll(roll as u8, &mut moves) == 0 {
+            stuck += probability;
+        }
+        let blocked = (0..path.len()).any(|index| {
+            if probe.board[path[index]] != sign * (index as i8 + 1) {
+                return false;
+            }
+            let destination = index + roll;
+            if destination >= path.len() {
+                return false;
+            }
+            let occupant = probe.board[path[destination]];
+            occupant != 0 && occupant * sign > 0
+        });
+        if blocked {
+            selfblock += probability;
+        }
+    }
+    (stuck, selfblock)
+}
+
+/// Rosettes held, which are both tempo (an extra roll) and geometry (in Finkel
+/// a piece on one cannot be taken, so it blocks the shared lane outright).
+fn rosettes_held(game: &Game, for_mover: bool) -> f64 {
+    let sign = if game.is_light_turn == for_mover { game.turn_sign() } else { -game.turn_sign() };
+    ROSETTES
+        .iter()
+        .filter(|&&tile| game.board[tile] * sign > 0)
+        .count() as f64
+}
+
 fn features(lut: &Lut, game: &Game) -> [f64; FEATURE_COUNT] {
     let sign = game.turn_sign();
     let (self_path, opp_path) = if game.is_light_turn {
@@ -2415,6 +2482,9 @@ fn features(lut: &Lut, game: &Game) -> [f64; FEATURE_COUNT] {
         (game.dark_pieces, game.light_pieces)
     };
 
+    let (stuck_self, selfblock_self) = blocking(lut, game, true);
+    let (stuck_opp, selfblock_opp) = blocking(lut, game, false);
+
     let _ = (self_path, opp_path);
     [
         advancement_self,
@@ -2431,6 +2501,12 @@ fn features(lut: &Lut, game: &Game) -> [f64; FEATURE_COUNT] {
         if game.board[CENTRE_ROSETTE] * sign < 0 { 1.0 } else { 0.0 },
         frontmost_self,
         frontmost_opp,
+        stuck_self,
+        stuck_opp,
+        selfblock_self,
+        selfblock_opp,
+        rosettes_held(game, true),
+        rosettes_held(game, false),
     ]
 }
 
