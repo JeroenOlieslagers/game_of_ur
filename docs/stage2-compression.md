@@ -315,23 +315,67 @@ where a 3,425-parameter network reaches 0.0799 -- better in absolute terms, wors
 per parameter by about five times. Engineered features remain the right choice at
 a budget of a few hundred weights.
 
-### The compressed model plays optimally
+### The curve, in the units that matter
 
-Finkel's 4.36M-parameter network, exported into the engine and played against
-the exact solution: **49.83% +/- 0.16** over 100,000 games. That is 1.1 standard
-errors from 50%, so at this sample size it is indistinguishable from perfect
-play -- from 17.4 MB against a 1.66 GB table.
+Regret is the cheap exact proxy; win rate against the exact solution is the
+quantity anyone actually cares about. Every model on the curve was compiled into
+the engine and played 100,000 games with sides alternating, so the
+rate-distortion curve below is *measured* in win-probability deficit rather than
+inferred from regret. Standard error is 0.158 throughout.
 
-The engine's own regret measurement on the exported weights (0.001387) matches
-the training script's (0.0013), which is what makes this a measurement of the
-model rather than of a broken export: the Rust encoder is a second
-implementation of the Python one and a mismatch would have been silent.
+| params | Blitz | Finkel | Masters |
+| --- | --- | --- | --- |
+| ~3.5k | 45.15 | 42.98 | 41.38 |
+| ~9k | 47.25 | 46.75 | 45.94 |
+| ~26k | 48.67 | 48.09 | 47.85 |
+| ~86k | 49.43 | 48.94 | 48.64 |
+| ~302k | 49.75 | 49.56 | 49.25 |
+| ~1.13M | **49.88** | **49.78** | **49.83** |
 
-Stage 1's amplification factor predicted 50 - 95 x 0.001387 = 49.87%. Measured
-49.83%. Consistent -- but a weak test, because the predicted deficit (0.13) is
-smaller than the noise (0.16); 50.0% and 49.87% both sit inside the error bar.
-Distinguishing them needs about a million games, which exceeded the four-hour
-walltime.
+A 1.13-million-parameter network -- 4.5 MB -- plays every rule set within 0.22
+points of a perfect opponent, against tables of 495 MB, 1.66 GB and 6.01 GB. At
+this sample size all three top models are within 1.4 standard errors of 50%,
+which is to say **indistinguishable from optimal play**. Even 86k parameters
+(339 KB) is inside half a point on blitz.
+
+The engine's own regret measurement on each exported model matches the training
+script's to three digits, which is what makes these measurements of the model
+rather than of a broken export: the Rust encoder is a second implementation of
+the Python one, and a mismatch would have been silent.
+
+### The amplification factor is a property of the rule set
+
+Stage 1 found that per-move regret converts to game-level win-rate deficit by a
+factor that looked constant within a rule set -- but that rested on two or three
+points from one family. It now rests on eighteen, spanning a 30x range of regret
+and three orders of magnitude of model size.
+
+| | stage 1 (rule lists, linear models) | stage 2 (networks, 3.5k - 1.1M params) |
+| --- | --- | --- |
+| Blitz | 62 - 63 | **58** |
+| Finkel | 89 - 98 | **98** |
+| Masters | 122 - 140 | **138** |
+
+Averaged over points where the deficit exceeds 0.5 (about three standard
+errors); below that the deficit is comparable to the noise and the ratio becomes
+unmeasurable rather than small. The agreement across completely disjoint model
+families is close to exact.
+
+So the conversion holds across **model families**, across **capacity**, and
+across a **30x range of regret**. That is what licenses optimising regret: it is
+not merely correlated with strength, it is proportional to it, with a constant
+that belongs to the rule set. And the constant tracks game length -- Masters
+games hold roughly twice the decisions of blitz ones -- which is why regret is
+not comparable between rule sets even though it is exact within one.
+
+**One anomaly worth recording.** Blitz's two largest models have essentially
+identical regret (0.002947 and 0.002943) but win 49.88% and 49.59% -- a 0.29
+point gap against a combined standard error of 0.22. At 1.3 standard errors this
+is suggestive rather than established, but if real it means regret stops being
+sufficient at the strong end: two models can give up the same average win
+probability per move while differing in whether those losses fall on pivotal or
+near-tie decisions. Settling it needs about a million games per point, roughly
+ten hours each at this network size.
 
 ### Model families do not trace one envelope
 
