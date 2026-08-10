@@ -42,7 +42,7 @@ Uniform random is the honest zero point.
 
 ## The features
 
-36 in three tiers, all from the mover's perspective.
+42 in four tiers, all from the mover's perspective.
 
 **State features (14)** describe the position after the move:
 `advancement_self/opp`, `scored_self/opp`, `hand_self/opp`, `safe_self/opp`,
@@ -65,6 +65,48 @@ the most regret while every capture feature was binary: `capture_value`,
 totals differ in *which* piece is capturable: `captures_frontmost`,
 `capture_gap_to_front`, `moves_frontmost`, `becomes_safe_forever`,
 `contact_possible`, `threat_count`.
+
+**Blocking (6)**, added last to close the one gap the set still had. Nothing
+above says whether a position can actually be *played*: advancement, exposure
+and threat are identical whether or not a legal move exists.
+
+- `stuck_self/opp` -- `sum_r P(r) * 1[no legal move with roll r]`
+- `selfblock_self/opp` -- `sum_r P(r) * 1[a piece is stopped by one of its own]`,
+  since a move cannot land on a friendly piece, so congestion is self-inflicted
+- `rosettes_self/opp` -- rosettes held, which are tempo (an extra roll) and, in
+  Finkel, geometry: a piece on one cannot be taken, so it blocks the shared lane
+
+### What blocking is worth
+
+As **main effects** they are close to worthless. Finkel's Shapley over regret
+puts `selfblock_self` at 1.7%, `stuck_self` at 0.5%, the rest under 0.4%, and
+`selfblock_opp` at -3.6%. Blocking is a thing Ur players talk about constantly
+and it carries almost no marginal decision-relevant information.
+
+In **interaction** it earns its place. Greedy selection picks
+`selfblock_self x leaves_centre` at term 8 of the frontier, `centre_opp x
+stuck_self` at 15 and `selfblock_self x lands_centre` at 17. The useful question
+is not "how blocked am I" but "does this move give up the centre *given* that I
+am congested".
+
+| Rule set | model | regret before | after | win % before | after |
+| --- | --- | --- | --- | --- | --- |
+| Blitz | additive | 0.1699 | 0.1614 | 39.31 | 39.85 |
+| Blitz | pairwise | 0.1081 | 0.0979 | 43.37 | 43.77 |
+| Finkel | additive | 0.2197 | 0.2119 | 28.53 | 30.39 |
+| Finkel | pairwise | 0.1151 | 0.1057 | 39.46 | 40.49 |
+| Masters | additive | 0.1334 | 0.1250 | 33.50 | 34.69 |
+| Masters | pairwise | 0.0930 | 0.0749 | 37.37 | 39.52 |
+
+Consistent gains of 3-19% in regret and 0.4-2.2 points of win rate, for six
+extra features (37 -> 43 additive, 667 -> 904 pairwise). Masters gains most,
+which fits: twelve war tiles make it the most congested board, so blocking is
+most informative there.
+
+One cost worth recording. The same six features make the *state evaluator*
+slightly worse -- the 21-weight version is behind the 15-weight one at matched
+search depth. Near-zero marginal value plus six more parameters to estimate is a
+bad trade when the model has no interactions to spend them on.
 
 ## Results
 
@@ -470,11 +512,11 @@ closer to optimal, but nothing here measures it.
   nothing in the 36 sees it. The N-tuple network reads board configurations
   directly and did add something on top of the scalars, which suggests the gap is
   real -- and it is a natural thing for stage 2 to recover on its own.
-- **Depth beyond 7.** Depths 1-7 are running; regret was still falling 15-20%
-  per ply at depth 5 with no sign of saturation, and depth 6 confirms it
-  continues (Finkel `advancement` 0.4047 -> 0.3324). Each ply costs about 13.5x
-  the last, so depth 8 needs the search rewritten with move ordering and pruning
-  rather than a bigger allocation.
+- **Depth beyond 8.** Depth 8 is now measured, using the transposition table
+  from `search-strategies.md` -- which cut the cost of a ply from 13.5x to 8.5x
+  and is what made it affordable at all. Fitted evaluator: blitz 0.0510, Finkel
+  0.0767, Masters 0.0646, with the last ply still buying 15%, 7% and 27%.
+  **Search does not saturate by eight plies.** Depth 9 is roughly another 8.5x.
 - **Blocking and per-piece geometry** remain the one real gap in the feature
   set. Adding them changes the feature count, which invalidates every fitted
   weight file, so it is a deliberate re-run of the roster, frontier, Shapley and
