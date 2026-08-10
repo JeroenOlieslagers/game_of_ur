@@ -245,162 +245,173 @@ schedule far more easily than multi-GPU ones. The binding constraint is streamin
 
 Long jobs go on the cluster. Local runs get killed.
 
-## Results so far (blitz)
+## Results
 
-Preliminary. The convergence control has not finished, so every number is "what
-this recipe reached", not "what this capacity can do" -- see the caveats at the
-end, which are load-bearing rather than decorative.
+All curves below use one recipe: 240,000 steps, batch 16,384, learning rate
+2e-3, two hidden layers, fitted on the whole table with no holdout. Getting to a
+single recipe took several passes and the story of that is at the end, because
+it changed conclusions rather than just numbers.
 
 ### The reference curve
 
 Quantising the table itself, scored by policy regret on 60,000 on-policy
-decisions. The policy floor -- the cost of tabulating only the argmax -- is
+decisions. The **policy floor** -- tabulating only the argmax, no values -- is
 **1.433 bits per decision state**.
 
 | bits/state | uniform | Lloyd-Max |
 | --- | --- | --- |
 | 1 | 1.2141 | 0.6402 |
 | 4 | 0.5042 | 0.1741 |
-| 5 | 0.2173 | 0.1131 |
 | 6 | 0.0842 | 0.0633 |
 | 8 | 0.0076 | 0.0237 |
 | 12 | 0.0000 | 0.0018 |
 
 Lloyd-Max wins below about six bits and **loses above seven**. It minimises
 squared value error, so it spends code points where the density is and accepts a
-ten-point maximum error; uniform keeps every sibling gap resolvable. Another
-instance of value error and move ordering coming apart, now in a setting with no
-model in it at all.
+ten-point maximum error; uniform keeps every sibling gap resolvable. Value error
+and move ordering coming apart, in a setting with no model in it at all.
 
-### The learned curve
+### The learned curves
 
-MLP, value objective, 60k steps on a GPU.
+Mean regret in win-probability points, on-policy.
 
-| params | regret | equivalent table rate | ratio vs table |
+| params | Blitz | Finkel | Masters |
 | --- | --- | --- | --- |
-| 3,425 | 0.0841 | ~6 bits/state | 2,260x |
-| 25,985 | 0.0282 | ~7 bits/state | 347x |
-| 563,201 | 0.0049 | ~8.5 bits/state | 20x |
+| ~3.5k | 0.0799 | 0.0783 | 0.0649 |
+| ~9k | 0.0470 | 0.0399 | 0.0336 |
+| ~26k | 0.0235 | 0.0215 | 0.0161 |
+| ~86k | 0.0110 | 0.0100 | 0.0092 |
+| ~302k | 0.0066 | 0.0047 | 0.0049 |
+| ~1.13M | 0.0033 | 0.0024 | 0.0033 |
+| ~4.35M | 0.0032 | **0.0013** | **0.0020** |
 
-**The advantage collapses by two orders of magnitude across the curve.** At low
-rate a network exploits structure the table does not encode, and that structure
-is worth enormous amounts; at high rate there is little left to find and it
-competes with raw storage on storage's terms. Where the learned and quantisation
-curves meet is the honest measure of how much of the game is *compressible*
-rather than merely tabulated.
+Blitz saturates at ~0.0032 -- four times the parameters buys nothing. Finkel and
+Masters are still improving at 4.35M.
 
-Stage 1's linear models still hold the extreme low end: 667 parameters reach
-0.1052, against 0.0841 for a 3,425-parameter network. Better in absolute terms,
-worse per parameter by about five times -- engineered features remain the right
-choice at a budget of a few hundred weights.
+### The two compressors obey different scaling laws
 
-### Value head against policy head
+Against the reference curve, on blitz:
 
-Both at 60k steps, the policy head trained on all 158,968,482 decisions.
+| params | regret | model | equivalent table rate | ratio |
+| --- | --- | --- | --- | --- |
+| 3,425 | 0.0799 | 0.11 Mbit | 6.04 bits/state | 2275x |
+| 25,985 | 0.0235 | 0.83 Mbit | 7.06 | 350x |
+| 300,545 | 0.0066 | 9.6 Mbit | 8.11 | 35x |
+| 4,347,905 | 0.0032 | 139 Mbit | 8.67 | 3x |
 
-| params | value | params | policy |
-| --- | --- | --- | --- |
-| 3,425 | **0.0841** | 4,209 | 0.1158 |
-| 25,985 | **0.0282** | 29,073 | 0.0450 |
-| 563,201 | **0.0049** | 575,505 | 0.0111 |
-| 2,174,977 | 0.0090 (unstable) | 2,199,569 | 0.0058 |
-| — | — | 8,593,425 | **0.0029** |
+The headline is usually stated as "the network's advantage collapses", which is
+true but hides the mechanism. **The equivalent table rate moves only 6.0 to 8.7
+bits per state across the entire sweep, while the model rate spans 1265x.**
 
-**The value head wins at every matched capacity and the gap widens with size**
-(27% to 56%). The reason is that scoring successors is not merely a cost of one
-forward pass per candidate -- it is a free ply of search, using dynamics the
-model does not have to learn. A policy head sees only the position and the roll
-and must internalise those dynamics. The advantage compounds as the evaluator
-becomes accurate enough to exploit it.
+Quantisation improves roughly *exponentially* in bits -- going from 6 to 9 bits
+cuts regret by 40x for 1.5x the storage. The network improves as a *power law*
+in parameters. Two different scaling laws, crossing around 8-9 bits per state.
+Below the crossing the network is worth thousands of times its size; above it,
+storing the table is simply the better compressor and no amount of capacity
+changes that.
 
-A second effect runs the other way: **the policy head trains stably where the
-value head does not.** Its curve is monotone to 8.6M parameters while the value
-head regressed at 2.2M and timed out above that. Cross-entropy over a discrete
-class appears better conditioned at scale than BCE against a continuous target,
-so at the top of the sweep the comparison is confounded by trainability rather
-than by information.
+Stage 1's linear models still hold the far left end: 667 parameters reach 0.1052
+where a 3,425-parameter network reaches 0.0799 -- better in absolute terms, worse
+per parameter by about five times. Engineered features remain the right choice at
+a budget of a few hundred weights.
 
-### Engineered features do not wash out
+### The compressed model plays optimally
 
-Stage 1's 14 state features concatenated to the input, same recipe both arms:
+Finkel's 4.36M-parameter network, exported into the engine and played against
+the exact solution: **49.83% +/- 0.16** over 100,000 games. That is 1.1 standard
+errors from 50%, so at this sample size it is indistinguishable from perfect
+play -- from 17.4 MB against a 1.66 GB table.
 
-| params | without | with | change |
-| --- | --- | --- | --- |
-| ~9k | 0.0790 | 0.0609 | -23% |
-| ~85k | 0.0279 | 0.0241 | -14% |
-| ~565k | 0.0134 | 0.0112 | -16% |
+The engine's own regret measurement on the exported weights (0.001387) matches
+the training script's (0.0013), which is what makes this a measurement of the
+model rather than of a broken export: the Rust encoder is a second
+implementation of the Python one and a mismatch would have been silent.
 
-The benefit persists at half a million parameters, which is the interesting
-outcome. The likely reason is `exposure` and `threat`: they are
-`sum_r P(r) * 1[capture available with roll r]`, a lookahead over the dice
-distribution rather than a function of current occupancy, so recovering them
-means learning to simulate a roll. They were also top of the stage-1
-Shapley-over-regret ranking.
+Stage 1's amplification factor predicted 50 - 95 x 0.001387 = 49.87%. Measured
+49.83%. Consistent -- but a weak test, because the predicted deficit (0.13) is
+smaller than the noise (0.16); 50.0% and 49.87% both sit inside the error bar.
+Distinguishing them needs about a million games, which exceeded the four-hour
+walltime.
 
 ### Model families do not trace one envelope
 
-Gradient boosting on the same inputs and the same evaluation set, capacity swept
-as trees x depth, with parameters counted as tree nodes:
+Same inputs, same evaluation set, blitz.
 
-| nodes | regret | MLP at comparable size |
+| family | penalty per parameter | compute |
 | --- | --- | --- |
-| 1,550 | 0.3142 | — |
-| 25,398 | 0.2608 | 0.0282 (25,985 params) |
-| 303,086 | 0.1786 | — |
-| 3,626,490 | 0.0730 | 0.0058 (2.2M params) |
+| MLP | -- (sets the envelope) | 1x |
+| Transformer | 1.4-2.7x worse | 25-47x |
+| Gradient boosting | 9-12x worse | ~2x |
 
-**Boosted trees are 9-12x worse per parameter than a dense net**, and that
-understates it: a tree node stores a feature index, a threshold and two child
-pointers, so it costs more than one float while being counted as one.
+**Boosted trees**: 25,398 nodes -> 0.2608 against an MLP's 25,985 params ->
+0.0282. Trees train on 4M of 41M states because boosting is not
+minibatch-incremental, so the obvious objection is that they are sample-limited;
+rerunning at 20M rows moves nothing (-2.4%, +4.8%, -5.3%, -8.6% at the four
+sizes, one in the wrong direction). The mismatch is representational: the
+quantities that matter are weighted sums over one-hot indicators, which a dense
+layer computes in one operation and a tree approximates with a deep cascade of
+axis-aligned splits.
 
-Boosting is not minibatch-incremental, so this trained on 4M of 41M states,
-which raises the obvious objection that the trees are sample-limited rather than
-capacity-limited. Rerunning at 20M rows moves nothing: -2.4%, +4.8%, -5.3%,
--8.6% at the four sizes, one of them in the wrong direction. The gap is real.
+**Attention**: 69,761 params -> 0.0281 against the MLP's 25,985 -> 0.0282. It
+needs 2.7x the parameters to match, at 47x the compute. The relational bias is
+real but there is nothing here to spend it on: a position is ~34 tokens with no
+long-range structure, and what decides moves are aggregates a dense layer
+already represents.
 
-The mechanism is a mismatch between the target and axis-aligned splits. The
-input is one-hot occupancy, and the quantities that matter -- total advancement,
-number of safe pieces -- are weighted sums over many indicators. A dense layer
-computes one in a single operation; a tree approximates it with a deep cascade
-of splits. This is a statement about representation, not about boosting being a
-weak learner.
+**Consequence for the claim.** "This rule set needs N bits" is an upper bound
+achieved by the best family tried, not a property of Ur. But since the simplest
+family wins, the bound is unlikely to be an artefact of a favoured architecture.
 
-**Consequence for how stage 2 should be stated.** A claim like "this rule set
-needs N bits" survives only as an upper bound achieved by the best known family,
-not as a property of Ur. The rate-distortion curve measured here describes dense
-networks; the reference quantisation curve describes the table. Whether some
-third family sits below both is open, and the transformer sweep is the next test
-of it.
+### Engineered features do not wash out
+
+Stage 1's state features concatenated to the input, same recipe both arms:
+-23% at ~9k params, -14% at ~85k, -16% at ~565k. The benefit persists at half a
+million parameters, which is the interesting part. The likely reason is
+`exposure` and `threat`: they are `sum_r P(r) * 1[capture available with roll r]`,
+a lookahead over the dice distribution rather than a function of current
+occupancy, so recovering them means learning to simulate a roll.
 
 ### How much of this is noise
 
-Two runs differing only in seed:
-
-| params | run A | run B | spread |
-| --- | --- | --- | --- |
-| 3,425 | 0.1413 | 0.1087 | 26% |
-| 25,985 | 0.0437 | 0.0461 | 5% |
-| 563,201 | 0.0129 | 0.0134 | 4% |
-
-Small models are far more sensitive to initialisation. Any difference under
-about 25% at a few thousand parameters, or under 5% at half a million, is not a
+Two runs differing only in seed: 26% apart at 3,425 params, 5% at 25,985, 4% at
+563,201. Small models are far more sensitive to initialisation. Any difference
+under about 25% at a few thousand parameters, or 5% at half a million, is not a
 result. This retired one comparison that had already been drawn.
 
-### Caveats
+## What went wrong, and what it cost
 
-- **Not converged.** The same 3,425-parameter model scored 0.1413 at 12k steps
-  and 0.0841 at 60k. Every point is an upper bound on distortion, and the
-  looseness may vary with capacity, which distorts the *shape* rather than
-  merely shifting the curve.
-- **The value head above 563k parameters is unreliable** -- 2.2M came out worse
-  than 563k, which means undertraining rather than a capacity limit.
-- **The ordering objective is not comparable.** It is trained on a sampled set
-  rather than the full space, so its rate axis measures a different object. Its
-  regret falls to zero while its value error *rises* to 21.8 points, which is the
-  signature of memorising a ranking.
-- **The pointer head result is uninformative.** It was built without the
-  per-move features that were its entire justification, so it adds parameters
-  without information and loses accordingly.
+Four things were measured wrongly before they were measured rightly. They are
+recorded because three of them produced *plausible numbers* rather than errors.
+
+**The learning rate was tuned once and generalised.** A coordinate sweep at
+256x2 on blitz chose 5e-3. At 1024x2 it gave 0.0099 and 0.0158 on two seeds
+where 2e-3 gives 0.0033; Finkel's largest size came out 9x worse. The tuning job
+existed *because* single-configuration results are untrustworthy, and its own
+output was a single configuration at one size on one rule set. What caught it was
+the anomaly being erratic rather than uniform -- two non-monotone points on one
+rule set. A smoothly wrong curve would have been reported.
+
+**Undertraining distorted the shape, not just the level.** 60k steps against
+240k costs 13% at 3.4k parameters and 24% at 26k. Larger models sit further from
+their asymptote, so the curve bends as well as shifts, and every ratio in the
+table above had to be recomputed rather than rescaled.
+
+**The policy head's training set contained its evaluation set.** Both were
+sampled on-policy from the opening, so a separately seeded 60k evaluation set was
+100% contained in the 400k training sample; a 575k-parameter model scored zero
+regret by memorising it. Fixed by enumerating the whole 159M-decision space.
+Alongside it, a `u16` legal mask silently aliased the last path position onto
+entry-from-hand on the two 16-tile rule sets, because Rust masks an over-wide
+shift in release rather than trapping.
+
+**Q2 is unresolved.** The ordering objective failed four times -- memorisation,
+softmax saturation on a 0-100 scale, sigmoid saturation of centred residuals, and
+a fourth that came back worse still. Each fix was made confidently and twice was
+wrong. The value and policy objectives both worked on first correct
+implementation, which is what a working objective looks like here. Rather than
+report a null result indistinguishable from a fifth bug, **the question is left
+open**: whether stage 1's value-versus-ordering finding survives capacity is not
+answered by this work.
 
 ## Order of work
 
