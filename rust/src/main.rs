@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::Instant;
 
+mod long_game;
+
 const WIDTH: usize = 3;
 const HEIGHT: usize = 8;
 const BOARD_LEN: usize = WIDTH * HEIGHT;
@@ -5609,7 +5611,7 @@ fn regret_report(
 }
 
 fn usage() -> ! {
-    eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis simulate <model.rgu> <output-dir> <label> [compare-states] [games-per-state] [games-per-epsilon] [shard-seed]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>\n  royalur_analysis dump-tensors <model.rgu> <output.bin> [stride] [offset]\n  royalur_analysis dump-decisions <model.rgu> <output.bin> [stride] [offset]\n  royalur_analysis dump-successors <model.rgu> <output.csv> [positions] [onpolicy|uniform] [seed]");
+    eprintln!("usage:\n  royalur_analysis verify <model.rgu> [samples]\n  royalur_analysis analyze <model.rgu> <output-dir> [gap-states] [compare-states] [games-per-state] [games-per-epsilon]\n  royalur_analysis preflight-train <percent16-model.rgu> [samples]\n  royalur_analysis train-f64 <percent16-model.rgu> <output-f64.rgu> [tolerance] [max-iterations] [ondemand-jacobi|precomputed-gauss-seidel]\n  royalur_analysis train-long-game <percent16-finkel.rgu> <output-duration.rgu> [tolerance] [max-sweeps]\n  royalur_analysis verify-long-game <duration.rgu> [samples]\n  royalur_analysis simulate-long-game <duration.rgu> <output-dir> [games] [seed]\n  royalur_analysis bench-layer <percent16-model.rgu> <min-score> <max-score> [sweeps] [work-dir]\n  royalur_analysis simulate <model.rgu> <output-dir> <label> [compare-states] [games-per-state] [games-per-epsilon] [shard-seed]\n  royalur_analysis compare-checkpoint <checkpoint> <layer-dir> <f64-model.rgu>\n  royalur_analysis dump-tensors <model.rgu> <output.bin> [stride] [offset]\n  royalur_analysis dump-decisions <model.rgu> <output.bin> [stride] [offset]\n  royalur_analysis dump-successors <model.rgu> <output.csv> [positions] [onpolicy|uniform] [seed]");
     std::process::exit(2);
 }
 
@@ -5620,6 +5622,31 @@ fn main() {
     }
     let command = args[1].as_str();
     let model = PathBuf::from(&args[2]);
+    if command == "train-long-game" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output = PathBuf::from(&args[3]);
+        let tolerance = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1e-10);
+        let max_sweeps = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        long_game::train(&model, &output, tolerance, max_sweeps);
+        return;
+    }
+    if command == "verify-long-game" {
+        let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
+        long_game::verify(&model, samples);
+        return;
+    }
+    if command == "simulate-long-game" {
+        if args.len() < 4 {
+            usage();
+        }
+        let output_dir = PathBuf::from(&args[3]);
+        let games = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10_000_000);
+        let seed = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x8b6d_4f2a_1937_c5e1);
+        long_game::simulate(&model, &output_dir, games, seed);
+        return;
+    }
     if command == "preflight-train" {
         let samples = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10_000);
         preflight_training(&model, samples);

@@ -14,6 +14,8 @@ results/
 random_results/
 bench/
 logs/
+long_game/long_game_*.out
+__pycache__/
 *.jld2
 *.csv
 
