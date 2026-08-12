@@ -473,7 +473,9 @@ fn solve_layer_accelerated(
 
     let mut best_residual = successors_residual(successors, indices, values);
     for block in 1..=max_blocks {
-        for _ in 0..200 {
+        // A short block of Bellman sweeps, kept as a safety floor and to keep
+        // the greedy policy fresh; the accelerated evaluation does the work.
+        for _ in 0..20 {
             bellman_sweep(values);
             sweeps += 1;
         }
@@ -525,7 +527,14 @@ fn solve_layer_accelerated(
         }
 
         let proposed = successors_residual(successors, indices, values);
-        if diverged || !proposed.is_finite() || proposed >= baseline_residual {
+        // Revert ONLY on a divergent or non-finite evaluation, which is the
+        // signature of an improper policy. Do NOT require the residual to fall:
+        // policy iteration's outer residual is legitimately non-monotone,
+        // because the value function jumps when the policy changes. Observed on
+        // layer (3,3): 161 -> 663 -> 1650 -> 408 -> ... -> 49.6, converging
+        // roughly threefold per iteration after the transient. Gating on a
+        // monotone residual blocks exactly the steps that make progress.
+        if diverged || !proposed.is_finite() {
             scatter(values, &baseline);
             best_residual = baseline_residual;
         } else {
