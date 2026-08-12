@@ -553,6 +553,20 @@ fn solve_layer_accelerated(
         // and (b) nowhere worse than what value iteration already had. Together
         // those mean a proposal can jump arbitrarily far ahead but can never
         // lose ground or overshoot.
+        // Combine rather than choose. Value iteration's vector and the policy
+        // evaluation are both valid lower bounds on V*, but in different
+        // states -- the evaluation can converge to a V_pi that sits below the
+        // current estimate somewhere, which previously threw the whole step
+        // away. The pointwise max of two lower bounds is itself a lower bound:
+        // T is monotone, so max >= V1 gives T(max) >= T(V1) >= V1, and likewise
+        // for V2, hence T(max) >= max. So keep the better of the two everywhere
+        // and the step can never lose ground.
+        for (position, &global) in indices.iter().enumerate() {
+            let slot = global as usize;
+            if baseline[position] > values[slot] {
+                values[slot] = baseline[position];
+            }
+        }
         let mut lowest_slack = f64::INFINITY;
         let mut lowest_gain = f64::INFINITY;
         for position in 0..positions {
