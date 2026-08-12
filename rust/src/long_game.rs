@@ -384,24 +384,53 @@ fn gauss_seidel(successors: &DurationSuccessors, indices: &[u32], values: &mut [
 /// which is the likely reason the earlier guarded extrapolation did not help.
 ///
 /// Returns `(bellman_residual, outer_iterations, inner_sweeps)`.
-fn solve_layer_policy_iteration(
+/// Guarded policy-evaluation acceleration on top of value iteration.
+///
+/// Two facts set the design. First, plain value iteration is *safe* here: this
+/// is an undiscounted positive-reward model, so iterating from V=0 increases
+/// monotonically to V* -- but it contracts at ~0.99998 per sweep because
+/// cooperating players avoid scoring, needing ~800k sweeps per layer.
+///
+/// Second, policy iteration is *not* safe here. Greedy improvement can produce
+/// an **improper** policy, one under which the players cycle forever and never
+/// score; for such a policy `(I - P_pi)` is singular and `V_pi = +infinity`, so
+/// the inner solve chases an infinite fixed point and the outer Bellman residual
+/// gets worse rather than better. That was observed directly: residual rising
+/// 161 -> 663 -> 1650 over three outer iterations.
+///
+/// So value iteration drives, and policy evaluation is only ever a *proposal*.
+/// After each block of Bellman sweeps the greedy policy is evaluated with Aitken
+/// extrapolation -- linear, hence one dominant mode, hence the geometric tail
+/// sums in a step -- and the result is adopted only if it strictly lowers the
+/// deterministic Bellman residual. A divergent or improper evaluation is
+/// detected and discarded, so the worst case is value iteration's own rate.
+///
+/// Returns `(bellman_residual, accepted_proposals, sweeps)`.
+fn solve_layer_accelerated(
     successors: &DurationSuccessors,
     indices: &[u32],
     values: &mut [f64],
     tolerance: f64,
-    max_outer: usize,
+    max_blocks: usize,
     label: &str,
 ) -> (f64, usize, usize) {
     let rolls = successors.active_rolls.len();
     let positions = indices.len();
     let mut policy = vec![0u32; positions * rolls];
-    let mut total_sweeps = 0usize;
+    let mut sweeps = 0usize;
+    let mut accepted = 0usize;
 
-    // `values` is the WHOLE table: successor entries carry global indices, so a
-    // layer-local slice would silently read the wrong states. Layer position
-    // `p` lives at `values[indices[p]]`.
-    let extract = |values: &[f64], policy: &mut [u32]| -> usize {
-        let mut changes = 0usize;
+    let bellman_sweep = |values: &mut [f64]| -> f64 {
+        let mut delta = 0.0f64;
+        for position in 0..positions {
+            let updated = successors.bellman(position, values);
+            let global = indices[position] as usize;
+            delta = delta.max((updated - values[global]).abs());
+            values[global] = updated;
+        }
+        delta
+    };
+    let extract = |values: &[f64], policy: &mut [u32]| {
         for position in 0..positions {
             for slot in 0..rolls {
                 let start = successors.offsets[position * rolls + slot] as usize;
@@ -415,17 +444,11 @@ fn solve_layer_policy_iteration(
                         choice = index as u32;
                     }
                 }
-                let slot_index = position * rolls + slot;
-                if policy[slot_index] != choice {
-                    changes += 1;
-                    policy[slot_index] = choice;
-                }
+                policy[position * rolls + slot] = choice;
             }
         }
-        changes
     };
-
-    let evaluate = |values: &mut [f64], policy: &[u32]| -> f64 {
+    let policy_sweep = |values: &mut [f64], policy: &[u32]| -> f64 {
         let mut delta = 0.0f64;
         for position in 0..positions {
             let mut total = 0.0;
@@ -442,27 +465,44 @@ fn solve_layer_policy_iteration(
     let gather = |values: &[f64]| -> Vec<f64> {
         indices.iter().map(|&g| values[g as usize]).collect()
     };
+    let scatter = |values: &mut [f64], layer: &[f64]| {
+        for (position, &global) in indices.iter().enumerate() {
+            values[global as usize] = layer[position];
+        }
+    };
 
-    let mut residual = f64::INFINITY;
-    let mut outer = 0usize;
-    while outer < max_outer {
-        outer += 1;
-        let changes = extract(values, &mut policy);
+    let mut best_residual = successors_residual(successors, indices, values);
+    for block in 1..=max_blocks {
+        for _ in 0..200 {
+            bellman_sweep(values);
+            sweeps += 1;
+        }
+        let baseline = gather(values);
+        let baseline_residual = successors_residual(successors, indices, values);
+        if baseline_residual <= tolerance {
+            best_residual = baseline_residual;
+            break;
+        }
 
-        // Adaptive inner accuracy. Solving to 1e-9 while the policy is still a
-        // third wrong is wasted work; the target tightens as the outer residual
-        // falls, which is what makes this *modified* policy iteration rather
-        // than the exact form.
-        let inner_target = (tolerance * 0.01).max(residual * 1e-3);
+        // Propose: evaluate the greedy policy with extrapolation.
+        extract(values, &mut policy);
         let mut previous_step: Option<Vec<f64>> = None;
         let mut snapshot = gather(values);
-        for round in 0..4_000 {
+        let mut diverged = false;
+        let mut smallest = f64::INFINITY;
+        for _round in 0..300 {
             let mut delta = 0.0;
-            for _ in 0..12 {
-                delta = evaluate(values, &policy);
-                total_sweeps += 1;
+            for _ in 0..8 {
+                delta = policy_sweep(values, &policy);
+                sweeps += 1;
             }
-            if delta < inner_target {
+            if !delta.is_finite() || delta > smallest * 100.0 {
+                // An improper policy has no finite value; stop chasing it.
+                diverged = true;
+                break;
+            }
+            smallest = smallest.min(delta);
+            if delta < tolerance * 0.1 {
                 break;
             }
             let current = gather(values);
@@ -474,18 +514,8 @@ fn solve_layer_policy_iteration(
                     let rho = numerator / denominator;
                     if rho > 0.0 && rho < 0.999_999 {
                         let scale = rho / (1.0 - rho);
-                        let saved = current.clone();
                         for (position, &global) in indices.iter().enumerate() {
                             values[global as usize] = current[position] + step[position] * scale;
-                        }
-                        let trial = evaluate(values, &policy);
-                        total_sweeps += 1;
-                        if trial >= delta {
-                            for (position, &global) in indices.iter().enumerate() {
-                                values[global as usize] = saved[position];
-                            }
-                        } else if round % 25 == 0 {
-                            eprintln!("{label} eval round={round} rho={rho:.9} delta={delta:.6e} -> {trial:.6e}");
                         }
                     }
                 }
@@ -494,17 +524,23 @@ fn solve_layer_policy_iteration(
             snapshot = gather(values);
         }
 
-        residual = successors_residual(successors, indices, values);
-        eprintln!("{label} outer={outer} policy_changes={changes} bellman_residual={residual:.6e} sweeps={total_sweeps}");
-        // The Bellman residual is the certificate: if max|T(V) - V| <= tol then
-        // V is the fixed point to tolerance. Requiring zero policy changes as
-        // well would never terminate, because near-tied actions flip on
-        // floating-point noise without moving any value.
-        if residual <= tolerance {
+        let proposed = successors_residual(successors, indices, values);
+        if diverged || !proposed.is_finite() || proposed >= baseline_residual {
+            scatter(values, &baseline);
+            best_residual = baseline_residual;
+        } else {
+            accepted += 1;
+            best_residual = proposed;
+        }
+        eprintln!(
+            "{label} block={block} sweeps={sweeps} vi_residual={baseline_residual:.6e} \
+             proposed={proposed:.6e} accepted={accepted} diverged={diverged}"
+        );
+        if best_residual <= tolerance {
             break;
         }
     }
-    (residual, outer, total_sweeps)
+    (best_residual, accepted, sweeps)
 }
 
 /// Maximum Bellman residual over a layer, single-threaded and deterministic.
@@ -557,8 +593,8 @@ fn solve_layer(
     if std::env::var("UR_LONG_VALUE_ITERATION").is_err() {
         let label = format!("long-game scores=[{},{}]", pair.0, pair.1);
         let started = Instant::now();
-        let (residual, outer, sweeps) = solve_layer_policy_iteration(
-            &successors, indices, &mut lut.values, tolerance, 200, &label);
+        let (residual, outer, sweeps) = solve_layer_accelerated(
+            &successors, indices, &mut lut.values, tolerance, 4_000, &label);
         if residual <= tolerance {
             eprintln!(
                 "{label} certified_residual={residual:.12e} outer={outer} sweeps={sweeps} \
