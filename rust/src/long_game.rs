@@ -515,9 +515,24 @@ fn solve_layer_accelerated(
                 if denominator > 0.0 {
                     let rho = numerator / denominator;
                     if rho > 0.0 && rho < 0.999_999 {
-                        let scale = rho / (1.0 - rho);
+                        // Cap the tail sum. At rho = 0.9999 the factor is 1e4,
+                        // so a 0.1 step becomes a 1000-unit jump on a value of
+                        // order 100 -- the extrapolation overshoots and the
+                        // sweep delta explodes.
+                        let scale = (rho / (1.0 - rho)).min(1.0e3);
+                        let saved = current.clone();
                         for (position, &global) in indices.iter().enumerate() {
                             values[global as usize] = current[position] + step[position] * scale;
+                        }
+                        // Guarded: keep the jump only on evidence that it helps.
+                        // Losing this guard in an earlier revision made every
+                        // extrapolation overshoot, which then read as a
+                        // divergent (improper) policy when it was nothing of
+                        // the kind.
+                        let trial = policy_sweep(values, &policy);
+                        sweeps += 1;
+                        if !trial.is_finite() || trial >= delta {
+                            scatter(values, &saved);
                         }
                     }
                 }
