@@ -575,11 +575,43 @@ fn solve_layer_accelerated(
             lowest_slack = lowest_slack.min(updated - values[global]);
             lowest_gain = lowest_gain.min(values[global] - baseline[position]);
         }
-        let proposed = successors_residual(successors, indices, values);
-        let admissible = !diverged
+        let mut proposed = successors_residual(successors, indices, values);
+        let mut admissible = !diverged
             && proposed.is_finite()
             && lowest_slack >= -1.0e-9
             && lowest_gain >= -1.0e-9;
+
+        // Backtrack rather than discard. The overshoot is stable (slack held at
+        // -0.44 across blocks), so the step is right in direction and only too
+        // large; blending back toward the value-iteration baseline finds the
+        // largest admissible fraction. theta = 0 is the baseline, which is
+        // always admissible, so this terminates.
+        if !admissible && !diverged && proposed.is_finite() {
+            let full: Vec<f64> = indices.iter().map(|&g| values[g as usize]).collect();
+            let mut theta = 0.5;
+            for _ in 0..8 {
+                for (position, &global) in indices.iter().enumerate() {
+                    let blended = baseline[position]
+                        + theta * (full[position] - baseline[position]);
+                    values[global as usize] = blended.max(baseline[position]);
+                }
+                let mut slack = f64::INFINITY;
+                for position in 0..positions {
+                    let global = indices[position] as usize;
+                    slack = slack.min(successors.bellman(position, values) - values[global]);
+                }
+                if slack >= -1.0e-9 {
+                    proposed = successors_residual(successors, indices, values);
+                    admissible = true;
+                    break;
+                }
+                theta *= 0.5;
+            }
+            if admissible {
+                eprintln!("{label} backtracked theta={theta:.4} -> residual={proposed:.6e}");
+            }
+        }
+
         if admissible {
             accepted += 1;
             best_residual = proposed;
