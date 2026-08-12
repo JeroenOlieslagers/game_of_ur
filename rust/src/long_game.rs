@@ -471,6 +471,21 @@ fn solve_layer_accelerated(
         }
     };
 
+    // The tolerance is RELATIVE to the layer's largest value. Values span 14
+    // actions in (6,6) to an expected 1e4 in the low-score layers, so a single
+    // absolute target is simultaneously unreachable at the top of that range
+    // (1e-8 on 1e4 is 1e-12 relative, past f64 accumulation over millions of
+    // states) and needlessly strict at the bottom. The achieved absolute
+    // residual and the scale are both logged so the relative precision is
+    // auditable rather than implied.
+    let effective = |values: &[f64]| -> f64 {
+        let mut scale = 1.0f64;
+        for &global in indices {
+            scale = scale.max(values[global as usize].abs());
+        }
+        tolerance * scale
+    };
+
     let mut best_residual = successors_residual(successors, indices, values);
     for block in 1..=max_blocks {
         // A short block of Bellman sweeps, kept as a safety floor and to keep
@@ -481,7 +496,8 @@ fn solve_layer_accelerated(
         }
         let baseline = gather(values);
         let baseline_residual = successors_residual(successors, indices, values);
-        if baseline_residual <= tolerance {
+        let target = effective(values);
+        if baseline_residual <= target {
             best_residual = baseline_residual;
             break;
         }
@@ -504,7 +520,7 @@ fn solve_layer_accelerated(
                 break;
             }
             smallest = smallest.min(delta);
-            if delta < tolerance * 0.1 {
+            if delta < target * 0.1 {
                 break;
             }
             let current = gather(values);
@@ -623,9 +639,9 @@ fn solve_layer_accelerated(
         eprintln!(
             "{label} block={block} sweeps={sweeps} vi_residual={baseline_residual:.6e} \
              proposed={proposed:.6e} slack={lowest_slack:.3e} gain={lowest_gain:.3e} \
-             admissible={admissible} accepted={accepted}"
+             admissible={admissible} accepted={accepted} target={target:.6e}"
         );
-        if best_residual <= tolerance {
+        if best_residual <= target {
             break;
         }
     }
