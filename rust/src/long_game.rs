@@ -366,6 +366,148 @@ fn gauss_seidel(successors: &DurationSuccessors, indices: &[u32], values: &mut [
     })
 }
 
+
+/// Modified policy iteration for the duration objective.
+///
+/// Value iteration is the wrong algorithm for this problem. Cooperating players
+/// avoid scoring, so the per-step probability of leaving a score layer is tiny,
+/// expected durations run to hundreds or thousands of actions, and the
+/// iteration contracts at a rate set by that escape probability: the observed
+/// per-sweep factor on layer (3,3) is 0.99998, needing ~800,000 sweeps for 1e-8
+/// on 0.9% of the state space.
+///
+/// Policy iteration attacks the cause. With the maximising action frozen, the
+/// evaluation step is *linear*, so its error is dominated by a single mode and
+/// Aitken extrapolation of the vector sequence sums the remaining geometric
+/// tail in one step. That is exactly what cannot be done to the raw Bellman
+/// iteration, where the argmax keeps shifting and the dominant mode with it --
+/// which is the likely reason the earlier guarded extrapolation did not help.
+///
+/// Returns `(bellman_residual, outer_iterations, inner_sweeps)`.
+fn solve_layer_policy_iteration(
+    successors: &DurationSuccessors,
+    indices: &[u32],
+    values: &mut [f64],
+    tolerance: f64,
+    max_outer: usize,
+    label: &str,
+) -> (f64, usize, usize) {
+    let rolls = successors.active_rolls.len();
+    let positions = indices.len();
+    let mut policy = vec![0u32; positions * rolls];
+    let mut total_sweeps = 0usize;
+
+    // `values` is the WHOLE table: successor entries carry global indices, so a
+    // layer-local slice would silently read the wrong states. Layer position
+    // `p` lives at `values[indices[p]]`.
+    let extract = |values: &[f64], policy: &mut [u32]| -> usize {
+        let mut changes = 0usize;
+        for position in 0..positions {
+            for slot in 0..rolls {
+                let start = successors.offsets[position * rolls + slot] as usize;
+                let end = successors.offsets[position * rolls + slot + 1] as usize;
+                let mut best = f64::NEG_INFINITY;
+                let mut choice = start as u32;
+                for index in start..end {
+                    let value = DurationSuccessors::resolve(successors.entries[index], values);
+                    if value > best {
+                        best = value;
+                        choice = index as u32;
+                    }
+                }
+                let slot_index = position * rolls + slot;
+                if policy[slot_index] != choice {
+                    changes += 1;
+                    policy[slot_index] = choice;
+                }
+            }
+        }
+        changes
+    };
+
+    let evaluate = |values: &mut [f64], policy: &[u32]| -> f64 {
+        let mut delta = 0.0f64;
+        for position in 0..positions {
+            let mut total = 0.0;
+            for (slot, &(_, probability)) in successors.active_rolls.iter().enumerate() {
+                let entry = successors.entries[policy[position * rolls + slot] as usize];
+                total += probability * DurationSuccessors::resolve(entry, values);
+            }
+            let global = indices[position] as usize;
+            delta = delta.max((total - values[global]).abs());
+            values[global] = total;
+        }
+        delta
+    };
+    let gather = |values: &[f64]| -> Vec<f64> {
+        indices.iter().map(|&g| values[g as usize]).collect()
+    };
+
+    let mut residual = f64::INFINITY;
+    let mut outer = 0usize;
+    while outer < max_outer {
+        outer += 1;
+        let changes = extract(values, &mut policy);
+
+        let mut previous_step: Option<Vec<f64>> = None;
+        let mut snapshot = gather(values);
+        for round in 0..4_000 {
+            let mut delta = 0.0;
+            for _ in 0..12 {
+                delta = evaluate(values, &policy);
+                total_sweeps += 1;
+            }
+            if delta < tolerance * 0.01 {
+                break;
+            }
+            let current = gather(values);
+            let step: Vec<f64> = current.iter().zip(&snapshot).map(|(a, b)| a - b).collect();
+            if let Some(earlier) = &previous_step {
+                let numerator = step.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let denominator = earlier.iter().map(|v: &f64| v * v).sum::<f64>().sqrt();
+                if denominator > 0.0 {
+                    let rho = numerator / denominator;
+                    if rho > 0.0 && rho < 0.999_999 {
+                        let scale = rho / (1.0 - rho);
+                        let saved = current.clone();
+                        for (position, &global) in indices.iter().enumerate() {
+                            values[global as usize] = current[position] + step[position] * scale;
+                        }
+                        let trial = evaluate(values, &policy);
+                        total_sweeps += 1;
+                        if trial >= delta {
+                            for (position, &global) in indices.iter().enumerate() {
+                                values[global as usize] = saved[position];
+                            }
+                        } else if round % 25 == 0 {
+                            eprintln!("{label} eval round={round} rho={rho:.9} delta={delta:.6e} -> {trial:.6e}");
+                        }
+                    }
+                }
+            }
+            previous_step = Some(step);
+            snapshot = gather(values);
+        }
+
+        residual = successors_residual(successors, indices, values);
+        eprintln!("{label} outer={outer} policy_changes={changes} bellman_residual={residual:.6e} sweeps={total_sweeps}");
+        if changes == 0 && residual <= tolerance {
+            break;
+        }
+    }
+    (residual, outer, total_sweeps)
+}
+
+/// Maximum Bellman residual over a layer, single-threaded and deterministic.
+fn successors_residual(successors: &DurationSuccessors, indices: &[u32], values: &[f64]) -> f64 {
+    let mut worst = 0.0f64;
+    for position in 0..indices.len() {
+        let global = indices[position] as usize;
+        worst = worst.max((successors.bellman(position, values) - values[global]).abs());
+    }
+    worst
+}
+
 fn solve_layer(
     lut: &mut TrainingLut,
     indices: &[u32],
@@ -399,6 +541,26 @@ fn solve_layer(
         worst == 0.0,
         "precomputed duration Bellman mismatch in layer {pair:?}: {worst:.3e}"
     );
+
+    // Policy iteration first. Value iteration is retained below only as a
+    // fallback if the policy loop fails to certify, since it is correct but
+    // impractically slow on this objective.
+    if std::env::var("UR_LONG_VALUE_ITERATION").is_err() {
+        let label = format!("long-game scores=[{},{}]", pair.0, pair.1);
+        let started = Instant::now();
+        let (residual, outer, sweeps) = solve_layer_policy_iteration(
+            &successors, indices, &mut lut.values, tolerance, 200, &label);
+        if residual <= tolerance {
+            eprintln!(
+                "{label} certified_residual={residual:.12e} outer={outer} sweeps={sweeps} \
+                 elapsed_seconds={:.1} total_seconds={:.1}",
+                started.elapsed().as_secs_f64(),
+                all_started.elapsed().as_secs_f64()
+            );
+            return residual;
+        }
+        eprintln!("{label} policy iteration did not certify ({residual:.6e}); falling back");
+    }
 
     let mut certified = f64::INFINITY;
     let acceleration_interval = 500usize;
