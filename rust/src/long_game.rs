@@ -449,6 +449,11 @@ fn solve_layer_policy_iteration(
         outer += 1;
         let changes = extract(values, &mut policy);
 
+        // Adaptive inner accuracy. Solving to 1e-9 while the policy is still a
+        // third wrong is wasted work; the target tightens as the outer residual
+        // falls, which is what makes this *modified* policy iteration rather
+        // than the exact form.
+        let inner_target = (tolerance * 0.01).max(residual * 1e-3);
         let mut previous_step: Option<Vec<f64>> = None;
         let mut snapshot = gather(values);
         for round in 0..4_000 {
@@ -457,7 +462,7 @@ fn solve_layer_policy_iteration(
                 delta = evaluate(values, &policy);
                 total_sweeps += 1;
             }
-            if delta < tolerance * 0.01 {
+            if delta < inner_target {
                 break;
             }
             let current = gather(values);
@@ -491,7 +496,11 @@ fn solve_layer_policy_iteration(
 
         residual = successors_residual(successors, indices, values);
         eprintln!("{label} outer={outer} policy_changes={changes} bellman_residual={residual:.6e} sweeps={total_sweeps}");
-        if changes == 0 && residual <= tolerance {
+        // The Bellman residual is the certificate: if max|T(V) - V| <= tol then
+        // V is the fixed point to tolerance. Requiring zero policy changes as
+        // well would never terminate, because near-tied actions flip on
+        // floating-point noise without moving any value.
+        if residual <= tolerance {
             break;
         }
     }
