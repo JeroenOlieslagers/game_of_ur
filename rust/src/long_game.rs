@@ -541,24 +541,43 @@ fn solve_layer_accelerated(
             snapshot = gather(values);
         }
 
+        // Guard the right invariant. The Bellman residual is NOT monotone in
+        // policy iteration -- the value function jumps when the policy changes
+        // -- so gating on it rejects the steps that make progress. But this is a
+        // maximisation approached from below, where the VALUES are monotone, and
+        // there is an exact test for staying below the optimum: if
+        // `T(V) >= V` pointwise then `V <= V*`, because T is monotone and
+        // iterating it from such a V increases to V*.
+        //
+        // So a proposal is adopted only if it is (a) still a valid lower bound,
+        // and (b) nowhere worse than what value iteration already had. Together
+        // those mean a proposal can jump arbitrarily far ahead but can never
+        // lose ground or overshoot.
+        let mut lowest_slack = f64::INFINITY;
+        let mut lowest_gain = f64::INFINITY;
+        for position in 0..positions {
+            let global = indices[position] as usize;
+            let updated = successors.bellman(position, values);
+            lowest_slack = lowest_slack.min(updated - values[global]);
+            lowest_gain = lowest_gain.min(values[global] - baseline[position]);
+        }
         let proposed = successors_residual(successors, indices, values);
-        // Revert ONLY on a divergent or non-finite evaluation, which is the
-        // signature of an improper policy. Do NOT require the residual to fall:
-        // policy iteration's outer residual is legitimately non-monotone,
-        // because the value function jumps when the policy changes. Observed on
-        // layer (3,3): 161 -> 663 -> 1650 -> 408 -> ... -> 49.6, converging
-        // roughly threefold per iteration after the transient. Gating on a
-        // monotone residual blocks exactly the steps that make progress.
-        if diverged || !proposed.is_finite() {
-            scatter(values, &baseline);
-            best_residual = baseline_residual;
-        } else {
+        let admissible = !diverged
+            && proposed.is_finite()
+            && lowest_slack >= -1.0e-9
+            && lowest_gain >= -1.0e-9;
+        if admissible {
             accepted += 1;
             best_residual = proposed;
+        } else {
+            scatter(values, &baseline);
+            best_residual = baseline_residual;
         }
+        let _ = &best_residual;
         eprintln!(
             "{label} block={block} sweeps={sweeps} vi_residual={baseline_residual:.6e} \
-             proposed={proposed:.6e} accepted={accepted} diverged={diverged}"
+             proposed={proposed:.6e} slack={lowest_slack:.3e} gain={lowest_gain:.3e} \
+             admissible={admissible} accepted={accepted}"
         );
         if best_residual <= tolerance {
             break;
