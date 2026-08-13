@@ -413,7 +413,7 @@ fn solve_layer_accelerated(
     tolerance: f64,
     max_blocks: usize,
     label: &str,
-) -> (f64, usize, usize) {
+) -> (f64, f64, usize, usize) {
     let rolls = successors.active_rolls.len();
     let positions = indices.len();
     let mut policy = vec![0u32; positions * rolls];
@@ -585,10 +585,15 @@ fn solve_layer_accelerated(
         }
         let mut lowest_slack = f64::INFINITY;
         let mut lowest_gain = f64::INFINITY;
+        let mut best_gain = 0.0f64;
         for position in 0..positions {
             let global = indices[position] as usize;
             let updated = successors.bellman(position, values);
             lowest_slack = lowest_slack.min(updated - values[global]);
+            // Largest improvement over the baseline, which is what shows
+            // progress; the minimum is >= 0 by construction after the
+            // pointwise max and so says nothing.
+            best_gain = best_gain.max(values[global] - baseline[position]);
             lowest_gain = lowest_gain.min(values[global] - baseline[position]);
         }
         let mut proposed = successors_residual(successors, indices, values);
@@ -639,13 +644,14 @@ fn solve_layer_accelerated(
         eprintln!(
             "{label} block={block} sweeps={sweeps} vi_residual={baseline_residual:.6e} \
              proposed={proposed:.6e} slack={lowest_slack:.3e} gain={lowest_gain:.3e} \
-             admissible={admissible} accepted={accepted} target={target:.6e}"
+             admissible={admissible} accepted={accepted} target={target:.6e} \
+             best_gain={best_gain:.3e}"
         );
         if best_residual <= target {
             break;
         }
     }
-    (best_residual, accepted, sweeps)
+    (best_residual, effective(values), accepted, sweeps)
 }
 
 /// Maximum Bellman residual over a layer, single-threaded and deterministic.
@@ -698,9 +704,14 @@ fn solve_layer(
     if std::env::var("UR_LONG_VALUE_ITERATION").is_err() {
         let label = format!("long-game scores=[{},{}]", pair.0, pair.1);
         let started = Instant::now();
-        let (residual, outer, sweeps) = solve_layer_accelerated(
+        let (residual, target, outer, sweeps) = solve_layer_accelerated(
             &successors, indices, &mut lut.values, tolerance, 4_000, &label);
-        if residual <= tolerance {
+        // Compare against the SAME relative target the solver used. Comparing a
+        // relative-tolerance result against the raw tolerance silently disabled
+        // the whole scheme: layer (2,3) met its target at 2.92 (scale ~29,000)
+        // and was then failed against 1e-4, falling back to value iteration for
+        // eight hours.
+        if residual <= target {
             eprintln!(
                 "{label} certified_residual={residual:.12e} outer={outer} sweeps={sweeps} \
                  elapsed_seconds={:.1} total_seconds={:.1}",
@@ -709,7 +720,9 @@ fn solve_layer(
             );
             return residual;
         }
-        eprintln!("{label} policy iteration did not certify ({residual:.6e}); falling back");
+        eprintln!(
+            "{label} policy iteration did not certify ({residual:.6e} > target {target:.6e}); falling back"
+        );
     }
 
     let mut certified = f64::INFINITY;
