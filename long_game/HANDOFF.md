@@ -1,5 +1,19 @@
 # Handoff: longest-game Finkel lookup policy
 
+> **Superseded in part. See `RESULTS.md` for what was actually computed.**
+>
+> The solve was run on Torch and produces a policy achieving 412,543 +/- 252
+> actions, but the lookup values did **not** converge to the optimum. The
+> handoff's plan was sound; what it could not anticipate is that this objective
+> is undiscounted with a per-sweep contraction of 0.99998, so a small Bellman
+> residual does not bound the error -- the amplification is `1/(1-rho) ~ 50,000`.
+> Its recommendation 4 ("consider a looser residual such as 1e-7 or 1e-8, but
+> verify policy stability separately") is therefore too optimistic: no tolerance
+> reachable in reasonable time certifies the value. Its recommendation 3
+> (modified policy iteration with a sparse linear solve) remains the right fix
+> and was not completed -- a Gauss-Seidel-plus-extrapolation approximation of it
+> was tried and did not converge either.
+
 ## Status at handoff
 
 The implementation is present and tested, but the full numerical solve is not
