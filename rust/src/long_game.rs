@@ -671,7 +671,7 @@ fn solve_layer(
     tolerance: f64,
     max_sweeps: usize,
     all_started: &Instant,
-) -> f64 {
+) -> (f64, f64) {
     let build_started = Instant::now();
     let successors = build_successors(lut, indices);
     eprintln!(
@@ -718,7 +718,7 @@ fn solve_layer(
                 started.elapsed().as_secs_f64(),
                 all_started.elapsed().as_secs_f64()
             );
-            return residual;
+            return (residual, target);
         }
         eprintln!(
             "{label} policy iteration did not certify ({residual:.6e} > target {target:.6e}); falling back"
@@ -745,8 +745,13 @@ fn solve_layer(
         if sweep % acceleration_interval == 0 {
             let (current, current_max) = residual_vector(&successors, indices, &lut.values);
             certified = current_max;
-            if certified <= tolerance {
-                return certified;
+            // Relative target here too, for the same reason as everywhere else.
+            let mut scale = 1.0f64;
+            for &global in indices {
+                scale = scale.max(lut.values[global as usize].abs());
+            }
+            if certified <= tolerance * scale {
+                return (certified, tolerance * scale);
             }
             if let Some((previous_sweep, previous)) = previous_residual.take() {
                 if let Some((corrections, nominal_factor)) =
@@ -792,7 +797,11 @@ fn solve_layer(
             }
         } else if delta <= tolerance || sweep % 100 == 0 {
             certified = residual(&successors, indices, &lut.values);
-            if certified <= tolerance {
+            let mut scale = 1.0f64;
+            for &global in indices {
+                scale = scale.max(lut.values[global as usize].abs());
+            }
+            if certified <= tolerance * scale {
                 eprintln!(
                     "long-game scores=[{},{}] certified_residual={:.12e} sweeps={} elapsed_seconds={:.1}",
                     pair.0,
@@ -801,14 +810,24 @@ fn solve_layer(
                     sweep,
                     all_started.elapsed().as_secs_f64()
                 );
-                return certified;
+                return (certified, tolerance * scale);
             }
         }
     }
-    if certified > tolerance {
-        certified = residual(&successors, indices, &lut.values);
+    {
+        let mut scale = 1.0f64;
+        for &global in indices {
+            scale = scale.max(lut.values[global as usize].abs());
+        }
+        if certified > tolerance * scale {
+            certified = residual(&successors, indices, &lut.values);
+        }
     }
-    certified
+    let mut scale = 1.0f64;
+    for &global in indices {
+        scale = scale.max(lut.values[global as usize].abs());
+    }
+    (certified, tolerance * scale)
 }
 
 fn write_map(lut: &TrainingLut, output: &Path, target_precision: f64, achieved_precision: f64) {
@@ -879,10 +898,15 @@ pub(super) fn train(input: &Path, output: &Path, tolerance: f64, max_sweeps: usi
             indices.len(),
             started.elapsed().as_secs_f64()
         );
-        let precision = solve_layer(&mut lut, &indices, pair, tolerance, max_sweeps, &started);
+        let (precision, target) =
+            solve_layer(&mut lut, &indices, pair, tolerance, max_sweeps, &started);
+        // Against the solver's own relative target. Comparing against the raw
+        // tolerance here is what killed every chain link in 30 seconds after
+        // the layer had in fact certified.
         assert!(
-            precision <= tolerance,
-            "layer {pair:?} did not converge within {max_sweeps} sweeps: {precision:.3e}"
+            precision <= target,
+            "layer {pair:?} did not converge within {max_sweeps} sweeps: \
+             {precision:.3e} > target {target:.3e}"
         );
         precisions[layer_index] = precision;
         append_checkpoint(&checkpoint, pair, precision, &indices, &lut.values);
