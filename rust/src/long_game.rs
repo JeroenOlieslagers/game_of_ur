@@ -517,6 +517,7 @@ fn solve_layer_exact(
     tolerance: f64,
     max_outer: usize,
     label: &str,
+    persist: &mut dyn FnMut(f64, &[f64]),
 ) -> Option<(f64, usize)> {
     const NOT_IN_LAYER: u32 = u32::MAX;
     let rolls = successors.active_rolls.len();
@@ -630,6 +631,12 @@ fn solve_layer_exact(
             outcome = Some((residual, outer));
             break;
         }
+        // Persist the improved values even though the layer has not certified.
+        // A four-hour walltime otherwise discards every policy iteration, which
+        // is how this layer burned eleven hours making the same partial
+        // progress three times. On reload the stored precision fails the
+        // tolerance test, so the layer is re-solved -- but from these values.
+        persist(residual, values);
     }
 
     for &global in indices {
@@ -926,6 +933,7 @@ fn solve_layer(
     max_sweeps: usize,
     all_started: &Instant,
     position_of: &mut [u32],
+    checkpoint_path: Option<&Path>,
 ) -> (f64, f64) {
     let build_started = Instant::now();
     let successors = build_successors(lut, indices);
@@ -968,8 +976,14 @@ fn solve_layer(
         }
         // Floating point sets the floor, not a chosen tolerance.
         let exact_target = (1.0e-10 * scale).max(1.0e-9);
+        let mut persist = |residual: f64, values: &[f64]| {
+            if let Some(path) = checkpoint_path {
+                append_checkpoint(path, pair, residual, indices, values);
+            }
+        };
         if let Some((residual, outer)) = solve_layer_exact(
-            &successors, indices, &mut lut.values, position_of, exact_target, 60, &label)
+            &successors, indices, &mut lut.values, position_of, exact_target, 60, &label,
+            &mut persist)
         {
             eprintln!(
                 "{label} EXACT certified_residual={residual:.12e} policy_iterations={outer} \
@@ -1183,7 +1197,8 @@ pub(super) fn train(input: &Path, output: &Path, tolerance: f64, max_sweeps: usi
             started.elapsed().as_secs_f64()
         );
         let (precision, target) = solve_layer(
-            &mut lut, &indices, pair, tolerance, max_sweeps, &started, &mut position_of);
+            &mut lut, &indices, pair, tolerance, max_sweeps, &started, &mut position_of,
+            Some(&checkpoint));
         // Against the solver's own relative target. Comparing against the raw
         // tolerance here is what killed every chain link in 30 seconds after
         // the layer had in fact certified.
