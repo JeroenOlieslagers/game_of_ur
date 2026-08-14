@@ -384,6 +384,229 @@ fn gauss_seidel(successors: &DurationSuccessors, indices: &[u32], values: &mut [
 /// which is the likely reason the earlier guarded extrapolation did not help.
 ///
 /// Returns `(bellman_residual, outer_iterations, inner_sweeps)`.
+
+/// Sparse linear system for one score layer under a fixed policy.
+///
+/// With the maximising action frozen, the value satisfies `V = b + A V`, where
+/// `A` holds only the transitions that stay *inside* the layer and `b` folds in
+/// the immediate reward plus any successor in an already-solved layer (whose
+/// value is final) or a terminal (worth zero). Moves that score leave the layer
+/// permanently, so `A` is substochastic and `I - A` is nonsingular exactly when
+/// the policy is proper.
+struct LayerSystem {
+    row_start: Vec<u32>,
+    column: Vec<u32>,
+    weight: Vec<f64>,
+    constant: Vec<f64>,
+}
+
+impl LayerSystem {
+    /// y = (I - A) x
+    fn apply(&self, x: &[f64], y: &mut [f64]) {
+        for row in 0..x.len() {
+            let start = self.row_start[row] as usize;
+            let end = self.row_start[row + 1] as usize;
+            let mut sum = 0.0;
+            for slot in start..end {
+                sum += self.weight[slot] * x[self.column[slot] as usize];
+            }
+            y[row] = x[row] - sum;
+        }
+    }
+}
+
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn norm(a: &[f64]) -> f64 {
+    dot(a, a).sqrt()
+}
+
+/// BiCGSTAB for `(I - A) x = b`.
+///
+/// A Krylov method rather than more sweeping, because sweeping *is* the problem:
+/// Gauss-Seidel on this system converges at the same rate as value iteration
+/// (~0.99998 per sweep) since both are governed by the tiny probability of
+/// leaving the layer. BiCGSTAB builds a Krylov subspace instead and is not
+/// bound by that rate.
+///
+/// Returns the achieved relative residual, or `None` if it stalled -- the
+/// signature of an improper policy, for which `I - A` is singular.
+fn bicgstab(system: &LayerSystem, b: &[f64], x: &mut [f64], tolerance: f64, max_iterations: usize)
+    -> Option<f64>
+{
+    let n = b.len();
+    let scale = norm(b).max(1.0);
+    let mut r = vec![0.0; n];
+    system.apply(x, &mut r);
+    for i in 0..n {
+        r[i] = b[i] - r[i];
+    }
+    let shadow = r.clone();
+    let mut p = vec![0.0; n];
+    let mut v = vec![0.0; n];
+    let mut s = vec![0.0; n];
+    let mut t = vec![0.0; n];
+    let mut rho: f64 = 1.0;
+    let mut alpha: f64 = 1.0;
+    let mut omega: f64 = 1.0;
+
+    for _ in 0..max_iterations {
+        let rho_next = dot(&shadow, &r);
+        if rho_next.abs() < 1e-300 || omega.abs() < 1e-300 {
+            return None; // breakdown
+        }
+        let beta = (rho_next / rho) * (alpha / omega);
+        for i in 0..n {
+            p[i] = r[i] + beta * (p[i] - omega * v[i]);
+        }
+        system.apply(&p, &mut v);
+        let denominator = dot(&shadow, &v);
+        if denominator.abs() < 1e-300 {
+            return None;
+        }
+        alpha = rho_next / denominator;
+        for i in 0..n {
+            s[i] = r[i] - alpha * v[i];
+        }
+        if norm(&s) / scale < tolerance {
+            for i in 0..n {
+                x[i] += alpha * p[i];
+            }
+            return Some(norm(&s) / scale);
+        }
+        system.apply(&s, &mut t);
+        let tt = dot(&t, &t);
+        if tt.abs() < 1e-300 {
+            return None;
+        }
+        omega = dot(&t, &s) / tt;
+        for i in 0..n {
+            x[i] += alpha * p[i] + omega * s[i];
+            r[i] = s[i] - omega * t[i];
+        }
+        let relative = norm(&r) / scale;
+        if relative < tolerance {
+            return Some(relative);
+        }
+        if !relative.is_finite() {
+            return None;
+        }
+        rho = rho_next;
+    }
+    None
+}
+
+/// Exact policy iteration for one layer.
+///
+/// Policy iteration on a finite MDP terminates after finitely many improvements
+/// at the *exact* optimum, provided each evaluation is exact. That is the whole
+/// reason for the Krylov solve: it removes the `1/(1-rho)` error amplification
+/// that makes a Bellman residual meaningless here, rather than trying to
+/// out-iterate it. At termination the residual is limited by floating point,
+/// not by a tolerance.
+///
+/// `position_of` maps a global state index to its position in this layer, and
+/// is scratch shared across layers to avoid reallocating 138M entries each time.
+fn solve_layer_exact(
+    successors: &DurationSuccessors,
+    indices: &[u32],
+    values: &mut [f64],
+    position_of: &mut [u32],
+    tolerance: f64,
+    max_outer: usize,
+    label: &str,
+) -> Option<(f64, usize)> {
+    const NOT_IN_LAYER: u32 = u32::MAX;
+    let rolls = successors.active_rolls.len();
+    let positions = indices.len();
+    for (position, &global) in indices.iter().enumerate() {
+        position_of[global as usize] = position as u32;
+    }
+
+    let mut policy = vec![0u32; positions * rolls];
+    let mut layer: Vec<f64> = indices.iter().map(|&g| values[g as usize]).collect();
+    let mut outcome = None;
+
+    for outer in 1..=max_outer {
+        // Greedy policy from the current values.
+        for position in 0..positions {
+            for slot in 0..rolls {
+                let start = successors.offsets[position * rolls + slot] as usize;
+                let end = successors.offsets[position * rolls + slot + 1] as usize;
+                let mut best = f64::NEG_INFINITY;
+                let mut choice = start as u32;
+                for index in start..end {
+                    let value = DurationSuccessors::resolve(successors.entries[index], values);
+                    if value > best {
+                        best = value;
+                        choice = index as u32;
+                    }
+                }
+                policy[position * rolls + slot] = choice;
+            }
+        }
+
+        // Assemble the frozen-policy system.
+        let mut system = LayerSystem {
+            row_start: Vec::with_capacity(positions + 1),
+            column: Vec::with_capacity(positions * rolls),
+            weight: Vec::with_capacity(positions * rolls),
+            constant: vec![0.0; positions],
+        };
+        system.row_start.push(0);
+        for position in 0..positions {
+            let mut constant = 0.0;
+            for (slot, &(_, probability)) in successors.active_rolls.iter().enumerate() {
+                let entry = successors.entries[policy[position * rolls + slot] as usize];
+                if entry & ACTION_FLAG != 0 {
+                    constant += probability;
+                }
+                let index = entry & INDEX_MASK;
+                if index == TERMINAL_INDEX {
+                    continue;
+                }
+                let global = index as usize;
+                let target = position_of[global];
+                if target == NOT_IN_LAYER {
+                    // Already-solved layer: its value is final, so it is data.
+                    constant += probability * values[global];
+                } else {
+                    system.column.push(target);
+                    system.weight.push(probability);
+                }
+            }
+            system.constant[position] = constant;
+            system.row_start.push(system.column.len() as u32);
+        }
+
+        let solved = bicgstab(&system, &system.constant, &mut layer, 1e-12, 20_000);
+        let Some(relative) = solved else {
+            eprintln!("{label} outer={outer} linear solve stalled (improper policy?)");
+            break;
+        };
+
+        for (position, &global) in indices.iter().enumerate() {
+            values[global as usize] = layer[position];
+        }
+
+        let residual = successors_residual(successors, indices, values);
+        eprintln!(
+            "{label} outer={outer} linear_relative={relative:.3e} bellman_residual={residual:.6e}"
+        );
+        if residual <= tolerance {
+            outcome = Some((residual, outer));
+            break;
+        }
+    }
+
+    for &global in indices {
+        position_of[global as usize] = NOT_IN_LAYER;
+    }
+    outcome
+}
+
 /// Guarded policy-evaluation acceleration on top of value iteration.
 ///
 /// Two facts set the design. First, plain value iteration is *safe* here: this
@@ -671,6 +894,7 @@ fn solve_layer(
     tolerance: f64,
     max_sweeps: usize,
     all_started: &Instant,
+    position_of: &mut [u32],
 ) -> (f64, f64) {
     let build_started = Instant::now();
     let successors = build_successors(lut, indices);
@@ -698,9 +922,35 @@ fn solve_layer(
         "precomputed duration Bellman mismatch in layer {pair:?}: {worst:.3e}"
     );
 
-    // Policy iteration first. Value iteration is retained below only as a
-    // fallback if the policy loop fails to certify, since it is correct but
-    // impractically slow on this objective.
+    // Exact policy iteration with a Krylov inner solve. This is the method
+    // that actually answers the question: policy iteration on a finite MDP
+    // terminates after finitely many improvements at the exact optimum when
+    // each evaluation is exact, so the result is not limited by a tolerance and
+    // the `1/(1-rho)` amplification that makes a Bellman residual meaningless
+    // here never enters.
+    if std::env::var("UR_LONG_NO_EXACT").is_err() {
+        let label = format!("long-game scores=[{},{}]", pair.0, pair.1);
+        let started = Instant::now();
+        let mut scale = 1.0f64;
+        for &global in indices {
+            scale = scale.max(lut.values[global as usize].abs());
+        }
+        // Floating point sets the floor, not a chosen tolerance.
+        let exact_target = (1.0e-10 * scale).max(1.0e-9);
+        if let Some((residual, outer)) = solve_layer_exact(
+            &successors, indices, &mut lut.values, position_of, exact_target, 60, &label)
+        {
+            eprintln!(
+                "{label} EXACT certified_residual={residual:.12e} policy_iterations={outer} \
+                 elapsed_seconds={:.1} total_seconds={:.1}",
+                started.elapsed().as_secs_f64(),
+                all_started.elapsed().as_secs_f64()
+            );
+            return (residual, exact_target);
+        }
+        eprintln!("{label} exact policy iteration failed; falling back");
+    }
+
     if std::env::var("UR_LONG_VALUE_ITERATION").is_err() {
         let label = format!("long-game scores=[{},{}]", pair.0, pair.1);
         let started = Instant::now();
@@ -885,6 +1135,9 @@ pub(super) fn train(input: &Path, output: &Path, tolerance: f64, max_sweeps: usi
     let checkpoint = output.with_extension("checkpoint");
     let (completed, mut precisions) =
         load_checkpoint(&checkpoint, &mut lut, &layer_dir, &pairs, tolerance);
+    // Global state index -> position within the layer being solved. Allocated
+    // once (552 MB) rather than per layer; each layer clears its own entries.
+    let mut position_of = vec![u32::MAX; lut.keys.len()];
     let started = Instant::now();
     for (layer_index, &pair) in pairs.iter().enumerate() {
         if completed[layer_index] {
@@ -898,8 +1151,8 @@ pub(super) fn train(input: &Path, output: &Path, tolerance: f64, max_sweeps: usi
             indices.len(),
             started.elapsed().as_secs_f64()
         );
-        let (precision, target) =
-            solve_layer(&mut lut, &indices, pair, tolerance, max_sweeps, &started);
+        let (precision, target) = solve_layer(
+            &mut lut, &indices, pair, tolerance, max_sweeps, &started, &mut position_of);
         // Against the solver's own relative target. Comparing against the raw
         // tolerance here is what killed every chain link in 30 seconds after
         // the layer had in fact certified.
@@ -1325,6 +1578,72 @@ pub(super) fn simulate(model: &Path, output_dir: &Path, games: usize, seed: u64)
     println!("policy={}", policy_path.display());
     println!("summary={}", summary_path.display());
     println!("simulation_seconds={seconds:.3}");
+}
+
+#[cfg(test)]
+mod linear_tests {
+    use super::*;
+
+    /// A three-state chain with a near-unit spectral radius, which is the regime
+    /// that defeats sweeping. Solved against the closed form.
+    #[test]
+    fn bicgstab_solves_a_near_singular_chain() {
+        // V0 = 1 + 0.99999 V1, V1 = 1 + 0.99999 V2, V2 = 1 + 0.99999 V2
+        let system = LayerSystem {
+            row_start: vec![0, 1, 2, 3],
+            column: vec![1, 2, 2],
+            weight: vec![0.99999, 0.99999, 0.99999],
+            constant: vec![1.0, 1.0, 1.0],
+        };
+        let mut x = vec![0.0; 3];
+        let relative = bicgstab(&system, &system.constant, &mut x, 1e-12, 1000)
+            .expect("near-singular but nonsingular system must solve");
+        assert!(relative <= 1e-12, "relative residual {relative:e}");
+
+        let v2 = 1.0 / (1.0 - 0.99999);
+        let v1 = 1.0 + 0.99999 * v2;
+        let v0 = 1.0 + 0.99999 * v1;
+        for (got, want) in x.iter().zip([v0, v1, v2]) {
+            assert!(
+                (got - want).abs() / want < 1e-9,
+                "got {got}, want {want}"
+            );
+        }
+    }
+
+    /// An improper policy -- every state loops forever with no escape -- makes
+    /// `I - A` singular. The solver must report failure rather than return
+    /// nonsense, because that is how an improper policy is detected upstream.
+    #[test]
+    fn bicgstab_reports_failure_on_a_singular_system() {
+        let system = LayerSystem {
+            row_start: vec![0, 1, 2],
+            column: vec![1, 0],
+            weight: vec![1.0, 1.0],
+            constant: vec![1.0, 1.0],
+        };
+        let mut x = vec![0.0; 2];
+        assert!(
+            bicgstab(&system, &system.constant, &mut x, 1e-12, 200).is_none(),
+            "a singular system must not report success"
+        );
+    }
+
+    /// The operator must be exactly `I - A`.
+    #[test]
+    fn apply_computes_identity_minus_matrix() {
+        let system = LayerSystem {
+            row_start: vec![0, 2, 3],
+            column: vec![0, 1, 0],
+            weight: vec![0.25, 0.5, 0.125],
+            constant: vec![0.0, 0.0],
+        };
+        let x = vec![4.0, 8.0];
+        let mut y = vec![0.0; 2];
+        system.apply(&x, &mut y);
+        assert_eq!(y[0], 4.0 - (0.25 * 4.0 + 0.5 * 8.0));
+        assert_eq!(y[1], 8.0 - 0.125 * 4.0);
+    }
 }
 
 #[cfg(test)]
