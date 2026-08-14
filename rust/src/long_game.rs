@@ -528,6 +528,7 @@ fn solve_layer_exact(
     let mut policy = vec![0u32; positions * rolls];
     let mut layer: Vec<f64> = indices.iter().map(|&g| values[g as usize]).collect();
     let mut outcome = None;
+    let mut stalls = 0usize;
 
     for outer in 1..=max_outer {
         // Greedy policy from the current values.
@@ -583,8 +584,32 @@ fn solve_layer_exact(
 
         let solved = bicgstab(&system, &system.constant, &mut layer, 1e-12, 20_000);
         let Some(relative) = solved else {
-            eprintln!("{label} outer={outer} linear solve stalled (improper policy?)");
-            break;
+            // The greedy policy is improper: under it the players cycle forever
+            // and never score, so its value is infinite and `I - A` is singular.
+            // This is repairable rather than fatal. Value iteration from below
+            // is always safe here, and raising V changes which action is greedy,
+            // which moves off the improper policy. Give up only if repeated
+            // repairs fail, since a genuinely improper *optimal* policy would
+            // mean the maximum expected duration is unbounded -- a fact about
+            // the game, not a solver failure.
+            stalls += 1;
+            eprintln!(
+                "{label} outer={outer} linear solve stalled (improper policy); \
+                 repairing with Bellman sweeps ({stalls})"
+            );
+            if stalls > 4 {
+                break;
+            }
+            for _ in 0..400 {
+                for position in 0..positions {
+                    let updated = successors.bellman(position, values);
+                    values[indices[position] as usize] = updated;
+                }
+            }
+            for (position, &global) in indices.iter().enumerate() {
+                layer[position] = values[global as usize];
+            }
+            continue;
         };
 
         for (position, &global) in indices.iter().enumerate() {
