@@ -582,10 +582,13 @@ fn solve_layer_exact(
             system.row_start.push(system.column.len() as u32);
         }
 
-        // 1e-9 relative, not 1e-12. Policy iteration tolerates an inexact evaluation
-        // as long as the error is small next to the improvement it drives, and
-        // each Krylov iteration on a five-million-state layer is expensive.
-        let solved = bicgstab(&system, &system.constant, &mut layer, 1e-9, 20_000);
+        // 1e-12, not 1e-9. Loosening this broke convergence: `I - A` has condition
+        // number of order 1/(1-rho) ~ 5e4 or worse, so the SOLUTION error is
+        // roughly kappa times the residual. At 1e-9 the evaluation was wrong
+        // enough that the next greedy policy was computed from bad values and
+        // policy iteration lost its improvement guarantee -- the Bellman
+        // residual oscillated 5145 -> 1010 -> 3158 -> 30133 instead of falling.
+        let solved = bicgstab(&system, &system.constant, &mut layer, 1e-12, 20_000);
         let Some(relative) = solved else {
             // The greedy policy is improper: under it the players cycle forever
             // and never score, so its value is infinite and `I - A` is singular.
