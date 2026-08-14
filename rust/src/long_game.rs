@@ -582,7 +582,10 @@ fn solve_layer_exact(
             system.row_start.push(system.column.len() as u32);
         }
 
-        let solved = bicgstab(&system, &system.constant, &mut layer, 1e-12, 20_000);
+        // 1e-9 relative, not 1e-12. Policy iteration tolerates an inexact evaluation
+        // as long as the error is small next to the improvement it drives, and
+        // each Krylov iteration on a five-million-state layer is expensive.
+        let solved = bicgstab(&system, &system.constant, &mut layer, 1e-9, 20_000);
         let Some(relative) = solved else {
             // The greedy policy is improper: under it the players cycle forever
             // and never score, so its value is infinite and `I - A` is singular.
